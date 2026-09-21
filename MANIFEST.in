@@ -7,6 +7,7 @@ recursive-include scripts *.py *.ps1
 recursive-include src/framepulse/web *.html *.css *.js
 recursive-include src/framepulse/schemas *.json
 recursive-include tests *.py
+recursive-include tests *.cjs
 prune .reference
 prune runtime
 prune qa-output

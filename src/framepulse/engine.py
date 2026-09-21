@@ -6,6 +6,7 @@ stages with independent provenance and per-shot atomic checkpoints.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from pathlib import Path
 import importlib.util
 import hashlib
@@ -13,31 +14,42 @@ import json
 import math
 import os
 import uuid
+import time
 
 import cv2
 import numpy as np
 
-from . import media, providers
+from . import __version__, media, providers
 from .locking import asset_lock
 from .media import AnalysisCancelled, check_cancel, emit
-from .protocol import claim, now_iso, read_document, stable_id, validate_document, write_document
+from .protocol import append_shot_checkpoint, build_overview, claim, compact_document, now_iso, read_document, stable_id, validate_document, write_document
 
 DETECTOR_VERSION = "adaptive-hsv-histogram-v1"
+PROFILES = {
+    "fast": {"name": "快速", "description": "完整逐帧测量，每镜 3 张证据；较低视觉尺寸，适合批量初筛。", "analysis_max_side": 256, "keyframes_per_shot": 3, "evidence_max_side": 960, "vision_max_frames": 3, "vision_max_side": 768, "context_limit": 8192},
+    "balanced": {"name": "均衡", "description": "完整逐帧测量，每镜 5 张证据；兼顾专业复核与处理速度。", "analysis_max_side": 320, "keyframes_per_shot": 5, "evidence_max_side": 1280, "vision_max_frames": 5, "vision_max_side": 960, "context_limit": 8192},
+    "detailed": {"name": "细读", "description": "完整逐帧测量，每镜 7 张证据；更高视觉尺寸及 16K 上下文，更慢且更占内存。", "analysis_max_side": 480, "keyframes_per_shot": 7, "evidence_max_side": 1600, "vision_max_frames": 7, "vision_max_side": 1280, "context_limit": 16384},
+}
 
 
 def _fingerprint(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def _measurement_fingerprint(threshold):
-    return _fingerprint({"threshold": float(threshold), "detector": DETECTOR_VERSION, "evidence_selection": "five-temporal-quality-v1"})
+def _measurement_fingerprint(threshold, profile="balanced"):
+    settings = PROFILES[profile]
+    return _fingerprint({"threshold": float(threshold), "detector": DETECTOR_VERSION, "evidence_selection": "temporal-quality-v2", "profile": profile,
+                         "analysis_max_side": settings["analysis_max_side"], "keyframes": settings["keyframes_per_shot"], "evidence_max_side": settings["evidence_max_side"]})
 
 
-def _vision_fingerprint(shot, provider_url, model):
+def _vision_fingerprint(shot, provider_url, model, profile="balanced"):
     parsed, path, native = providers.provider_endpoint(provider_url)
+    settings = PROFILES[profile]
+    count = settings["vision_max_frames"]
     data = {"endpoint": parsed.scheme + "://" + parsed.netloc + path, "model": model,
-                         "prompt": providers.SYSTEM_PROMPT, "response_schema": providers._output_schema([f"K{i+1}" for i in range(min(5, len(shot["keyframes"])))]),
-                         "evidence": shot["keyframes"][:5], "adapter": "native-compact-schema-8k-v3" if native else "compatible-compact-v3"}
+                         "prompt": providers.SYSTEM_PROMPT, "response_schema": providers._output_schema([f"K{i+1}" for i in range(min(count, len(shot["keyframes"])))]),
+                         "evidence": shot["keyframes"][:count], "adapter": "native-profile-v4" if native else "compatible-profile-v4",
+                         "profile": profile, "image_max_side": settings["vision_max_side"], "context_limit": settings["context_limit"] if native else None}
     if shot.get("extensions", {}).get("display_notes"):
         data["display_notes"] = shot["extensions"]["display_notes"]
     return _fingerprint(data)
@@ -49,7 +61,8 @@ def capabilities():
         ffprobe = media.ffprobe_executable()
     except (ImportError, RuntimeError, ValueError):
         ffmpeg = ffprobe = None
-    return {"ffmpeg": {"available": bool(ffmpeg), "path": ffmpeg},
+    return {"max_video_duration_us": media.MAX_VIDEO_DURATION_US, "profiles": deepcopy(PROFILES),
+            "ffmpeg": {"available": bool(ffmpeg), "path": ffmpeg},
             "ffprobe": {"available": bool(ffprobe), "path": ffprobe},
             "image": True, "video": bool(ffmpeg), "shot_detection": "adaptive-full-frame-hsv-histogram",
             "vision": {"available": True, "requires_configuration": True, "providers": ["openai-compatible", "ollama"],
@@ -92,6 +105,15 @@ def _preserve_reviewed(doc, previous):
     doc["runs"] += [deepcopy(run) for run in previous.get("runs", []) if run["id"] not in run_ids]
     if len(previous.get("history", [])) > len(doc.get("history", [])):
         doc["history"] = deepcopy(previous["history"])
+    current_shot_ids = {shot["id"] for shot in doc["shots"]}
+    current_frame_ids = {frame["id"] for shot in doc["shots"] for frame in shot["keyframes"]}
+    for field, item in previous.get("overview", {}).get("analysis", {}).items():
+        if not _protected(item):
+            continue
+        if set(item.get("evidence_ids", [])) <= current_frame_ids and set(item.get("source_shot_ids", [])) <= current_shot_ids:
+            doc.setdefault("overview", {}).setdefault("analysis", {})[field] = deepcopy(item)
+        else:
+            doc["extensions"].setdefault("archived_overview_claims", {})[field] = deepcopy(item)
 
 
 def _checkpoint(path, doc):
@@ -100,10 +122,32 @@ def _checkpoint(path, doc):
         _preserve_reviewed(doc, previous)
         doc["revision"] = max(doc.get("revision", 0), previous.get("revision", 0)) + 1
     doc["updated_at"] = now_iso()
+    doc["overview"] = build_overview(doc)
     errors = validate_document(doc)
     if errors:
         raise ValueError("内部记录校验失败: " + "; ".join(errors[:5]))
-    write_document(path, doc)
+    compact_document(path, doc)
+
+
+@contextmanager
+def _shot_checkpoints(path, doc):
+    """Small durable per-shot writes; complete sidecar on every controlled exit."""
+    cursor = len(doc["history"])
+    pending = 0
+    last_compact = time.monotonic()
+    def save(shot):
+        nonlocal cursor, pending, last_compact
+        append_shot_checkpoint(path, doc, shot, doc["history"][cursor:])
+        cursor = len(doc["history"])
+        pending += 1
+        if pending >= 25 or time.monotonic() - last_compact >= 60:
+            _checkpoint(path, doc)
+            pending = 0
+            last_compact = time.monotonic()
+    try:
+        yield save
+    finally:
+        _checkpoint(path, doc)
 
 
 def _run(kind, provider, model=None, config=None):
@@ -120,17 +164,18 @@ def _shot(sha, index, span, keyframes, run, score=None):
             "review": {"state": "unreviewed", "note": ""}, "status": "measured", "warnings": []}
 
 
-def _measure(source, bundle, sha, threshold, cancel, progress):
-    run = _run("measurement", "framepulse-ffmpeg", config={"threshold": threshold, "detector": DETECTOR_VERSION, "frame_sampling": "all-decoded-frames", "keyframes": "five-temporal-bins-quality-selection"})
+def _measure(source, bundle, sha, threshold, cancel, progress, profile="balanced", technical_hint=None):
+    settings = PROFILES[profile]
+    run = _run("measurement", "framepulse-ffmpeg", config={"threshold": threshold, "detector": DETECTOR_VERSION, "frame_sampling": "all-decoded-frames", "profile": profile, "keyframes_per_shot": settings["keyframes_per_shot"], "keyframes": "temporal-bins-quality-selection"})
     doc = {"format": "framepulse.media", "spec_version": "0.1.0", "id": stable_id("framepulse.media", sha), "revision": 1,
            "created_at": now_iso(), "updated_at": now_iso(),
            "asset": {"id": "urn:sha256:" + sha, "kind": "image" if source.suffix.lower() in media.IMAGE_EXTENSIONS else "video",
                      "name": source.name, "source": {"uri": source.as_uri(), "sha256": sha, "size_bytes": source.stat().st_size}, "technical": {}},
            "time": {"unit": "microseconds", "origin": "first_presented_frame", "interval": "half-open"},
-           "shots": [], "runs": [run], "history": [], "warnings": [], "extensions": {"generator": "FramePulse Open 0.1.0", "measurement_fingerprint": _measurement_fingerprint(threshold)}}
+           "shots": [], "runs": [run], "history": [], "warnings": [], "extensions": {"generator": "FramePulse Open " + __version__, "profile": profile, "measurement_fingerprint": _measurement_fingerprint(threshold, profile)}}
     if doc["asset"]["kind"] == "image":
         emit(progress, "measure", 0, 1, "读取图片尺寸与方向")
-        technical, metrics, evidence, warnings = media.prepare_image(source, bundle, cancel)
+        technical, metrics, evidence, warnings = media.prepare_image(source, bundle, cancel, max_side=settings["evidence_max_side"])
         run["provider"] = "framepulse-pillow"
         keyframe = {"id": stable_id(sha, "frame", "image"), "time_us": None, **evidence}
         shot = _shot(sha, 1, None, [keyframe], run)
@@ -144,20 +189,41 @@ def _measure(source, bundle, sha, threshold, cancel, progress):
         doc["shots"].append(shot)
         doc["warnings"].extend(warnings)
     else:
-        emit(progress, "probe", 0, 1, "读取视频与音轨元数据")
-        technical = media.probe_video(source, cancel)
-        frames, cuts, warnings = media.scan_video(source, technical, threshold, cancel, progress)
-        selections = [media.select_keyframes(frames, start, end) for start, end in zip(cuts, cuts[1:])]
-        images = media.extract_keyframes(source, bundle, [index for selection in selections for index in selection], technical, cancel, progress)
-        for i, (start, end) in enumerate(zip(cuts, cuts[1:])):
+        cache_path = bundle / ".measurement-cache.json"
+        cache = None
+        if cache_path.is_file():
+            try:
+                candidate = read_document(cache_path)
+                if candidate.get("sha256") == sha and candidate.get("fingerprint") == _measurement_fingerprint(threshold, profile):
+                    cache = candidate
+            except (ValueError, OSError):
+                pass
+        if cache:
+            technical, plans, warnings = cache["technical"], cache["plans"], cache["warnings"]
+            media.enforce_duration_limit(technical, decoded=True)
+            run["config"]["scan_reused"] = True
+            emit(progress, "resume", 1, 1, "恢复已完成的逐帧测量；继续提取证据")
+        else:
+            technical = deepcopy(technical_hint) if technical_hint else media.probe_video(source, cancel)
+            frames, cuts, warnings = media.scan_video(source, technical, threshold, cancel, progress, max_side=settings["analysis_max_side"])
+            plans = []
+            for start, end in zip(cuts, cuts[1:]):
+                selected = media.select_keyframes(frames, start, end, count=settings["keyframes_per_shot"])
+                plans.append({"range": {"start_us": frames[start]["time_us"], "end_us": frames[end]["time_us"] if end < len(frames) else technical["duration_us"]},
+                              "frames": [{key: frames[index][key] for key in ("index", "time_us", "source_pts")} for index in selected],
+                              "score": frames[start]["cut_score"] if start else None,
+                              "metrics": {field: round(float(np.mean([frame[field] for frame in frames[start:end]])), 5) for field in ("brightness", "saturation", "sharpness")}})
+            del frames
+            write_document(cache_path, {"sha256": sha, "fingerprint": _measurement_fingerprint(threshold, profile), "technical": technical, "plans": plans, "warnings": warnings})
+        images = media.extract_keyframes(source, bundle, [frame["index"] for plan in plans for frame in plan["frames"]], technical, cancel, progress, max_side=settings["evidence_max_side"])
+        for i, plan in enumerate(plans):
             check_cancel(cancel)
-            span = {"start_us": frames[start]["time_us"], "end_us": frames[end]["time_us"] if end < len(frames) else technical["duration_us"]}
-            keyframes = [{"id": stable_id(sha, "frame", index), "time_us": frames[index]["time_us"],
-                          "decode_index": index, "source_pts": frames[index]["source_pts"], **images[index]} for index in selections[i]]
-            shot = _shot(sha, i + 1, span, keyframes, run, frames[start]["cut_score"] if start else None)
+            keyframes = [{"id": stable_id(sha, "frame", frame["index"]), "time_us": frame["time_us"],
+                          "decode_index": frame["index"], "source_pts": frame["source_pts"], **images[frame["index"]]} for frame in plan["frames"]]
+            shot = _shot(sha, i + 1, plan["range"], keyframes, run, plan["score"])
             ids = [frame["id"] for frame in keyframes]
             for field in ("brightness", "saturation", "sharpness"):
-                shot["analysis"][field] = claim(round(float(np.mean([frame[field] for frame in frames[start:end]])), 5), "measured", None, ids, run["id"])
+                shot["analysis"][field] = claim(plan["metrics"][field], "measured", None, ids, run["id"])
             frame = cv2.imdecode(np.fromfile(bundle / keyframes[len(keyframes) // 2]["uri"], dtype=np.uint8), cv2.IMREAD_COLOR)
             shot["analysis"]["dominant_colors"] = claim(media.dominant_colors(frame), "measured", None, [keyframes[len(keyframes) // 2]["id"]], run["id"])
             if len(keyframes) < 3:
@@ -220,11 +286,14 @@ def _ocr_shot(shot, bundle, reader, run, cancel):
 
 
 def analyze_asset(source: Path, output_root: Path, *, vision=False, provider_url=None, model=None, api_key=None,
-                  threshold=27.0, resume=True, progress=None, cancel=None, ocr=False) -> Path:
+                  threshold=27.0, resume=True, progress=None, cancel=None, ocr=False, profile="balanced") -> Path:
     source = Path(source).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError("找不到素材文件: " + str(source))
+    if not isinstance(profile, str) or profile not in PROFILES:
+        raise ValueError("profile 必须为 fast、balanced 或 detailed")
+    settings = PROFILES[profile]
     if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or not 0 < threshold <= 255:
         raise ValueError("镜头检测 threshold 必须在 (0, 255] 内")
     if vision:
@@ -233,6 +302,11 @@ def analyze_asset(source: Path, output_root: Path, *, vision=False, provider_url
             raise ValueError("启用 AI 需要指定视觉模型名称 model")
     if ocr and importlib.util.find_spec("rapidocr_onnxruntime") is None:
         raise ValueError("OCR 尚未安装；安装可选依赖 rapidocr-onnxruntime 后重试")
+    technical_hint = None
+    if source.suffix.lower() not in media.IMAGE_EXTENSIONS:
+        emit(progress, "probe", 0, 1, "检查视频元数据与 45 分钟时长上限")
+        technical_hint = media.probe_video(source, cancel)
+        media.enforce_duration_limit(technical_hint)
     initial_stat = source.stat()
     sha = media.sha256_file(source, cancel, progress)
     bundle = output_root / sha
@@ -242,19 +316,24 @@ def analyze_asset(source: Path, output_root: Path, *, vision=False, provider_url
         check_cancel(cancel)
         previous = read_document(record) if record.is_file() else None
         if previous:
+            if "overview" in previous:
+                # This is a derived index. Third-party direct shot edits may
+                # leave its cached coverage stale; rebuild before validation.
+                previous["overview"] = build_overview(previous)
             errors = validate_document(previous)
             if errors or previous["asset"]["source"]["sha256"] != sha:
                 raise ValueError("已存在的记录无效，不能安全续跑；请另选输出目录或先修复记录")
-        measurement_matches = previous and previous.get("extensions", {}).get("measurement_fingerprint") == _measurement_fingerprint(threshold)
+        measurement_matches = previous and previous.get("extensions", {}).get("measurement_fingerprint") == _measurement_fingerprint(threshold, profile)
         if resume and measurement_matches:
             doc = previous
+            doc["extensions"]["generator"] = "FramePulse Open " + __version__
             if any(not (bundle / frame["uri"]).is_file() for shot in doc["shots"] for frame in shot["keyframes"]):
                 raise ValueError("续跑所需关键帧缺失；请使用新输出目录重新测量")
             doc["asset"]["source"]["uri"] = source.as_uri()
             doc["asset"]["name"] = source.name
             emit(progress, "resume", 1, 1, f"恢复记录 · {len(doc['shots'])} 个镜头")
         else:
-            doc = _measure(source, bundle, sha, threshold, cancel, progress)
+            doc = _measure(source, bundle, sha, threshold, cancel, progress, profile, technical_hint)
             if previous:
                 doc["created_at"] = previous["created_at"]
                 doc["history"] = deepcopy(previous.get("history", []))
@@ -270,82 +349,85 @@ def analyze_asset(source: Path, output_root: Path, *, vision=False, provider_url
             if (after.st_size, after.st_mtime_ns) != (initial_stat.st_size, initial_stat.st_mtime_ns):
                 raise RuntimeError("分析过程中源文件发生变化，请在文件写入完成后重试")
         _checkpoint(record, doc)
-        if doc["asset"]["kind"] == "video":
-            try:
-                media.make_preview(source, bundle, doc["asset"]["technical"], cancel, progress)
-            except AnalysisCancelled:
-                raise
-            except Exception as exc:
-                doc["warnings"].append(f"浏览器预览未生成 ({type(exc).__name__})；原始分析记录已保留。")
-                _checkpoint(record, doc)
-        if ocr:
-            from rapidocr_onnxruntime import RapidOCR
-            reader = RapidOCR()
-            run = _run("ocr", "rapidocr-onnxruntime", config={"local_only": True, "orientation": "display-corrected", "sampled_keyframes_only": True})
-            doc["runs"].append(run)
-            failed = 0
-            try:
-                for index, shot in enumerate(doc["shots"]):
-                    check_cancel(cancel)
-                    if shot["review"]["state"] in {"accepted", "edited", "rejected"} or (resume and shot.get("extensions", {}).get("ocr_completed")):
-                        continue
-                    emit(progress, "ocr", index + 1, len(doc["shots"]), f"本地文字识别 · 镜头 {index + 1}")
-                    try:
-                        _ocr_shot(shot, bundle, reader, run, cancel)
-                    except AnalysisCancelled:
-                        raise
-                    except Exception as exc:
-                        failed += 1
-                        shot["warnings"].append(f"OCR 失败 ({type(exc).__name__})；可重试。")
+        (bundle / ".measurement-cache.json").unlink(missing_ok=True)
+        with _shot_checkpoints(record, doc) as save_shot:
+            if doc["asset"]["kind"] == "video":
+                try:
+                    media.make_preview(source, bundle, doc["asset"]["technical"], cancel, progress)
+                except AnalysisCancelled:
+                    raise
+                except Exception as exc:
+                    doc["warnings"].append(f"浏览器预览未生成 ({type(exc).__name__})；原始分析记录已保留。")
                     _checkpoint(record, doc)
-                run.update(status="partial" if failed else "completed", completed_at=now_iso(), failed_shots=failed)
-            except AnalysisCancelled:
-                run.update(status="cancelled", completed_at=now_iso())
-                _checkpoint(record, doc)
-                raise
-            _checkpoint(record, doc)
-        if vision:
-            _, _, native = providers.provider_endpoint(provider_url)
-            run = _run("vision", "ollama" if native else "openai-compatible", model,
-                       {"provider_url": provider_url, "keyframes_per_shot": 5, "confidence_calibrated": False, "prompt_version": "director-compact-v3", "evidence_association": "all-submitted-keyframes-unless-model-cites-specific-frames", "context_limit": 8192 if native else None})
-            doc["runs"].append(run)
-            failed, done, skipped = 0, 0, 0
-            try:
-                for index, shot in enumerate(doc["shots"]):
-                    check_cancel(cancel)
-                    signature = _vision_fingerprint(shot, provider_url, model)
-                    if shot["review"]["state"] in {"accepted", "edited", "rejected"} or (resume and shot["status"] == "analyzed" and shot.get("extensions", {}).get("vision_fingerprint") == signature):
-                        if shot["status"] == "analyzed":
-                            shot.setdefault("extensions", {}).setdefault("vision_status", "completed")
-                        skipped += 1
-                        continue
-                    emit(progress, "vision", index + 1, len(doc["shots"]), f"视觉模型分析 · 镜头 {index + 1}/{len(doc['shots'])}")
-                    try:
-                        result = providers.analyze_shot(shot, bundle, provider_url, model, api_key, cancel=cancel)
+            if ocr:
+                from rapidocr_onnxruntime import RapidOCR
+                reader = RapidOCR()
+                run = _run("ocr", "rapidocr-onnxruntime", config={"local_only": True, "orientation": "display-corrected", "sampled_keyframes_only": True})
+                doc["runs"].append(run)
+                failed = 0
+                try:
+                    for index, shot in enumerate(doc["shots"]):
                         check_cancel(cancel)
-                        previous_ai = {group: {field: deepcopy(item) for field, item in shot[group].items() if item.get("origin") == "inferred" and item.get("value") is not None} for group in ("analysis", "emotion")}
-                        if any(previous_ai.values()):
-                            doc["history"].append({"at": now_iso(), "actor": "engine", "action": "vision-reanalysis", "shot_id": shot["id"], "run_id": run["id"], "before": previous_ai})
-                        _apply_vision(shot, result, run)
-                        shot.setdefault("extensions", {})["vision_fingerprint"] = signature
-                        shot["extensions"]["vision_usage"] = result.get("usage", {})
-                        done += 1
-                    except AnalysisCancelled:
-                        raise
-                    except Exception as exc:
-                        failed += 1
-                        shot["status"] = "failed"
-                        message = str(exc) if isinstance(exc, (providers.ProviderError, TimeoutError, ValueError)) else type(exc).__name__
-                        shot["warnings"].append("AI 分析失败: " + message[:300])
+                        if shot["review"]["state"] in {"accepted", "edited", "rejected"} or (resume and shot.get("extensions", {}).get("ocr_completed")):
+                            continue
+                        emit(progress, "ocr", index + 1, len(doc["shots"]), f"本地文字识别 · 镜头 {index + 1}")
+                        try:
+                            _ocr_shot(shot, bundle, reader, run, cancel)
+                        except AnalysisCancelled:
+                            raise
+                        except Exception as exc:
+                            failed += 1
+                            shot["warnings"].append(f"OCR 失败 ({type(exc).__name__})；可重试。")
+                        save_shot(shot)
+                    run.update(status="partial" if failed else "completed", completed_at=now_iso(), failed_shots=failed)
+                except AnalysisCancelled:
+                    run.update(status="cancelled", completed_at=now_iso())
                     _checkpoint(record, doc)
-                run.update(status="failed" if failed and not done else "partial" if failed else "completed",
-                           completed_at=now_iso(), analyzed_shots=done, failed_shots=failed, skipped_shots=skipped)
-            except AnalysisCancelled:
-                run.update(status="cancelled", completed_at=now_iso(), analyzed_shots=done, failed_shots=failed)
+                    raise
                 _checkpoint(record, doc)
-                raise
-            _checkpoint(record, doc)
-        abstained = sum(shot.get("extensions", {}).get("vision_status") == "abstained" for shot in doc["shots"])
-        detail = "；部分 AI 镜头失败，可续跑" if any(shot["status"] == "failed" for shot in doc["shots"]) else f"；{abstained} 个镜头模型弃答，语义保持未知" if abstained else ""
-        emit(progress, "complete", len(doc["shots"]), len(doc["shots"]), "记录已保存" + detail)
-        return record
+            if vision:
+                _, _, native = providers.provider_endpoint(provider_url)
+                run = _run("vision", "ollama" if native else "openai-compatible", model,
+                           {"provider_url": provider_url, "profile": profile, "keyframes_per_shot": settings["vision_max_frames"], "confidence_calibrated": False, "prompt_version": "director-profile-v4", "evidence_association": "all-submitted-keyframes-unless-model-cites-specific-frames", "context_limit": settings["context_limit"] if native else None})
+                doc["runs"].append(run)
+                failed, done, skipped = 0, 0, 0
+                try:
+                    for index, shot in enumerate(doc["shots"]):
+                        check_cancel(cancel)
+                        signature = _vision_fingerprint(shot, provider_url, model, profile)
+                        if shot["review"]["state"] in {"accepted", "edited", "rejected"} or (resume and shot["status"] == "analyzed" and shot.get("extensions", {}).get("vision_fingerprint") == signature):
+                            if shot["status"] == "analyzed":
+                                shot.setdefault("extensions", {}).setdefault("vision_status", "completed")
+                            skipped += 1
+                            continue
+                        emit(progress, "vision", index + 1, len(doc["shots"]), f"视觉模型分析 · 镜头 {index + 1}/{len(doc['shots'])}")
+                        try:
+                            result = providers.analyze_shot(shot, bundle, provider_url, model, api_key, cancel=cancel,
+                                                            max_frames=settings["vision_max_frames"], image_max_side=settings["vision_max_side"], context_limit=settings["context_limit"])
+                            check_cancel(cancel)
+                            previous_ai = {group: {field: deepcopy(item) for field, item in shot[group].items() if item.get("origin") == "inferred" and item.get("value") is not None} for group in ("analysis", "emotion")}
+                            if any(previous_ai.values()):
+                                doc["history"].append({"at": now_iso(), "actor": "engine", "action": "vision-reanalysis", "shot_id": shot["id"], "run_id": run["id"], "before": previous_ai})
+                            _apply_vision(shot, result, run)
+                            shot.setdefault("extensions", {})["vision_fingerprint"] = signature
+                            shot["extensions"]["vision_usage"] = result.get("usage", {})
+                            done += 1
+                        except AnalysisCancelled:
+                            raise
+                        except Exception as exc:
+                            failed += 1
+                            shot["status"] = "failed"
+                            message = str(exc) if isinstance(exc, (providers.ProviderError, TimeoutError, ValueError)) else type(exc).__name__
+                            shot["warnings"].append("AI 分析失败: " + message[:300])
+                        save_shot(shot)
+                    run.update(status="failed" if failed and not done else "partial" if failed else "completed",
+                               completed_at=now_iso(), analyzed_shots=done, failed_shots=failed, skipped_shots=skipped)
+                except AnalysisCancelled:
+                    run.update(status="cancelled", completed_at=now_iso(), analyzed_shots=done, failed_shots=failed)
+                    _checkpoint(record, doc)
+                    raise
+                _checkpoint(record, doc)
+            abstained = sum(shot.get("extensions", {}).get("vision_status") == "abstained" for shot in doc["shots"])
+            detail = "；部分 AI 镜头失败，可续跑" if any(shot["status"] == "failed" for shot in doc["shots"]) else f"；{abstained} 个镜头模型弃答，语义保持未知" if abstained else ""
+            emit(progress, "complete", len(doc["shots"]), len(doc["shots"]), "记录已保存" + detail)
+            return record

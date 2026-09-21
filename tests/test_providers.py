@@ -1,5 +1,7 @@
 """Provider output is untrusted: verify limits, evidence, and network controls."""
 import json
+import base64
+import io
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -109,4 +111,39 @@ def test_native_request_short_ids_and_retry_real_json_only(tmp_path, monkeypatch
     assert isinstance(requests[0]["format"], dict)
     assert "stable-real-frame-uuid" not in json.dumps(requests[0])
     assert result["analysis"]["summary"]["evidence_ids"] == ["stable-real-frame-uuid"]
+    assert result["warnings"]
+
+
+def test_profile_bounds_images_and_regions_remain_keyframe_only(tmp_path, monkeypatch):
+    (tmp_path / "frames").mkdir()
+    Image.new("RGB", (1600, 800), "blue").save(tmp_path / "frames/large.jpg")
+    shot = {"range": {"start_us": 0, "end_us": 1_000_000}, "keyframes": [
+        {"id": f"frame-{i}", "time_us": i * 100_000, "uri": "frames/large.jpg"} for i in range(7)]}
+    requests = []
+    def post(url, body, *args, **kwargs):
+        requests.append(body)
+        return {"done_reason": "stop", "load_duration": 500_000_000, "prompt_eval_duration": 1_500_000_000, "eval_duration": 2_000_000_000, "total_duration": 4_000_000_000, "eval_count": 400,
+                "message": {"content": json.dumps({"analysis": {"summary": "蓝色物体", "visual_medium": "3d_animation", "themes": ["城市"]},
+                 "regions": [{"keyframe_id": "K2", "xywh": [0.1, 0.2, 0.4, 0.5], "label": "主体", "confidence": None}]})}}
+    monkeypatch.setattr(providers, "_post_json", post)
+    result = providers.analyze_shot(shot, tmp_path, "http://127.0.0.1:11434/v1", "fixture", max_frames=3, image_max_side=768, context_limit=8192)
+    images = requests[0]["messages"][-1]["images"]
+    assert len(images) == 3
+    assert Image.open(io.BytesIO(base64.b64decode(images[0]))).size == (768, 384)
+    assert requests[0]["options"]["num_ctx"] == 8192
+    assert result["analysis"]["visual_medium"]["value"] == "3d_animation"
+    assert result["regions"][0]["keyframe_id"] == "frame-1"
+    assert result["regions"][0]["extensions"] == {"source": "vision", "tracking": False}
+    assert "time_range" not in result["regions"][0]
+    assert result["usage"]["load_seconds"] == 0.5
+    assert result["usage"]["prompt_eval_seconds"] == 1.5
+    assert result["usage"]["eval_seconds"] == 2
+    assert result["usage"]["total_seconds"] == 4
+    assert result["usage"]["generation_tokens_per_second"] == 200
+
+
+def test_unsupported_visual_medium_does_not_get_invented_label():
+    raw = {"analysis": {"summary": "测试", "visual_medium": {"value": {"guess": "CG"}}}}
+    result = providers.normalize_result(raw, ["frame-1"])
+    assert result["analysis"]["visual_medium"]["value"] is None
     assert result["warnings"]

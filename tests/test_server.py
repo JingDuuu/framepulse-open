@@ -89,3 +89,33 @@ def test_asset_lock_blocks_cross_process_editor(client):
     with asset_lock(folder):
         reply = browser.patch("/api/assets/" + "a" * 64 + "/shots/shot-1", json={"revision": 1}, headers={"x-framepulse-token": "testing-token"})
     assert reply.status_code == 409
+
+
+def test_folder_queue_is_pending_and_settings_are_secret_free(client, tmp_path):
+    browser, folder = client
+    headers = {"x-framepulse-token": "testing-token"}
+    inputs = tmp_path / "input"
+    inputs.mkdir()
+    (inputs / "image.jpg").write_bytes(b"placeholder")
+    (inputs / "ignore.txt").write_text("ignore")
+    configured = browser.post("/api/config", json={"provider_url": "http://127.0.0.1:11434/v1", "model": "vision", "profile": "fast", "vision": False, "api_key": "not-in-response-or-disk"}, headers=headers)
+    assert configured.status_code == 200
+    assert configured.json()["has_api_key"] is True
+    assert "not-in-response-or-disk" not in configured.text
+    added = browser.post("/api/queue/add", json={"paths": [str(inputs)]}, headers=headers)
+    assert added.status_code == 200
+    job = added.json()["jobs"][0]
+    assert job["state"] == "pending"
+    assert job["profile"] == "fast" and job["vision"] is False
+    assert browser.get("/api/jobs").json()["queue"]["state"] == "idle"
+    assert browser.post("/api/queue/add", json={"paths": [str(inputs)]}, headers=headers).json()["jobs"] == []
+    assert browser.post(f"/api/jobs/{job['id']}/cancel", headers=headers).status_code == 200
+    assert browser.post(f"/api/jobs/{job['id']}/retry", headers=headers).status_code == 200
+    assert "not-in-response-or-disk" not in (folder.parent / "queue.local.json").read_text(encoding="utf-8")
+    assert "not-in-response-or-disk" not in (folder.parent / "settings.local.json").read_text()
+
+
+def test_queue_and_config_mutations_require_token(client):
+    browser, _ = client
+    for route, body in [("/api/queue/add", {"paths": ["x"]}), ("/api/queue/start", {}), ("/api/config", {"model": "x"})]:
+        assert browser.post(route, json=body).status_code == 403

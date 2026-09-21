@@ -12,6 +12,9 @@ import math
 import os
 import tempfile
 import uuid
+from collections import Counter
+from copy import deepcopy
+from functools import lru_cache
 from urllib.parse import urljoin
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,8 +43,83 @@ def claim(value: Any, origin: str = "measured", confidence: float | None = None,
 def read_document(path: str | Path) -> dict:
     def invalid_constant(value):
         raise ValueError(f"JSON 不允许非有限数值: {value}")
+    path = Path(path)
     with open(path, "r", encoding="utf-8-sig") as handle:
-        return json.load(handle, parse_constant=invalid_constant)
+        doc = json.load(handle, parse_constant=invalid_constant)
+    journal = _journal_path(path)
+    if path.name != "record.fmp.json" or not journal.is_file():
+        return doc
+    changed = False
+    with journal.open("rb") as handle:
+        for line in handle:
+            # A crashed append can leave an incomplete final line. Earlier
+            # durable lines remain authoritative; never guess a partial event.
+            if not line.endswith(b"\n"):
+                break
+            event = json.loads(line, parse_constant=invalid_constant)
+            if event.get("format") != "framepulse.checkpoint" or event.get("document_id") != doc.get("id"):
+                raise ValueError("检查点日志与素材记录不匹配")
+            revision = event.get("revision")
+            if not isinstance(revision, int) or isinstance(revision, bool):
+                raise ValueError("检查点 revision 无效")
+            if revision <= doc["revision"]:
+                continue  # Compacted or superseded by a later human edit.
+            if revision != doc["revision"] + 1:
+                raise ValueError("检查点日志缺少连续修订，不能安全恢复")
+            shot = event["shot"]
+            position = next((i for i, current in enumerate(doc["shots"]) if current["id"] == shot["id"]), None)
+            if position is None:
+                raise ValueError("检查点引用了不存在的镜头")
+            doc["shots"][position] = shot
+            run = event.get("run")
+            if run:
+                position = next((i for i, current in enumerate(doc["runs"]) if current["id"] == run["id"]), None)
+                if position is None:
+                    doc["runs"].append(run)
+                else:
+                    doc["runs"][position] = run
+            doc["history"].extend(event.get("history_append", []))
+            doc.update(revision=revision, updated_at=event["updated_at"])
+            changed = True
+    if changed:
+        doc["overview"] = build_overview(doc)
+    return doc
+
+
+def _journal_path(path: Path) -> Path:
+    return path.with_name("record.fmp.journal.jsonl")
+
+
+def append_shot_checkpoint(path: str | Path, doc: dict, shot: dict, history_append: list | None = None) -> None:
+    """Private live journal. Caller owns the asset lock; final JSON is standalone."""
+    path = Path(path)
+    errors = validate_shot(shot, {run["id"] for run in doc["runs"]})
+    if errors:
+        raise ValueError("镜头检查点校验失败: " + "; ".join(errors[:4]))
+    revision = doc["revision"] + 1
+    updated_at = now_iso()
+    event = {"format": "framepulse.checkpoint", "document_id": doc["id"], "revision": revision,
+             "updated_at": updated_at, "shot": shot, "run": doc["runs"][-1] if doc["runs"] else None,
+             "history_append": history_append or []}
+    encoded = (json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    journal = _journal_path(path)
+    with journal.open("a+b") as handle:
+        handle.seek(0)
+        existing = handle.read()
+        if existing and not existing.endswith(b"\n"):
+            handle.seek(existing.rfind(b"\n") + 1)
+            handle.truncate()
+        handle.seek(0, os.SEEK_END)
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    doc.update(revision=revision, updated_at=updated_at)
+
+
+def compact_document(path: str | Path, doc: dict) -> None:
+    """Publish a complete snapshot before removing superseded private events."""
+    write_document(path, doc)
+    _journal_path(Path(path)).unlink(missing_ok=True)
 
 
 def write_document(path: str | Path, doc: dict) -> None:
@@ -61,13 +139,50 @@ def write_document(path: str | Path, doc: dict) -> None:
             os.unlink(name)
 
 
+@lru_cache(maxsize=1)
+def _schema():
+    return read_document(Path(__file__).parent / "schemas" / "fmp-0.1.schema.json")
+
+
+def validate_shot(shot: dict, run_ids: set[str]) -> list[str]:
+    import jsonschema
+    try:
+        json.dumps(shot, allow_nan=False)
+    except (ValueError, TypeError):
+        return ["shot contains a non-JSON value or non-finite number"]
+    schema = _schema()
+    validator = jsonschema.Draft202012Validator({"$ref": "#/$defs/shot", "$defs": schema["$defs"]})
+    errors = [error.message for error in validator.iter_errors(shot)]
+    if errors:
+        return errors[:20]
+    frame_ids = {frame["id"] for frame in shot["keyframes"]}
+    entity_ids = [shot["id"], *[frame["id"] for frame in shot["keyframes"]], *[region["id"] for region in shot["regions"]]]
+    if len(set(entity_ids)) != len(entity_ids):
+        errors.append("duplicate entity id")
+    for group in ("analysis", "emotion"):
+        for field, item in shot[group].items():
+            if any(identifier not in frame_ids for identifier in item["evidence_ids"]):
+                errors.append(f"{field}: unresolved evidence")
+            if item["run_id"] is not None and item["run_id"] not in run_ids:
+                errors.append(f"{field}: unresolved run")
+            if group == "emotion" and item["value"] is not None and (isinstance(item["value"], bool) or not isinstance(item["value"], (float, int)) or not 0 <= item["value"] <= 1):
+                errors.append(f"{field}: emotion must be null or in [0,1]")
+    for region in shot["regions"]:
+        x, y, width, height = region["xywh"]
+        if width <= 0 or height <= 0 or x + width > 1.000001 or y + height > 1.000001:
+            errors.append("invalid region geometry")
+        if region["keyframe_id"] not in frame_ids:
+            errors.append("unresolved region keyframe")
+    return errors
+
+
 def validate_document(doc: Any) -> list[str]:
     import jsonschema
     try:
         json.dumps(doc, allow_nan=False)
     except (ValueError, TypeError):
         return ["document contains a non-JSON value or non-finite number"]
-    schema = read_document(Path(__file__).parent / "schemas" / "fmp-0.1.schema.json")
+    schema = _schema()
     errors = [f"{'/'.join(map(str, e.absolute_path)) or '$'}: {e.message}"
               for e in jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker()).iter_errors(doc)]
     if errors:
@@ -127,7 +242,103 @@ def validate_document(doc: Any) -> list[str]:
         errors.append("image assets must have exactly one image unit")
     if len(run_ids) != len(doc["runs"]):
         errors.append("duplicate run id")
+    overview = doc.get("overview")
+    if overview:
+        shot_ids = {shot["id"] for shot in doc["shots"]}
+        frame_ids = {frame["id"] for shot in doc["shots"] for frame in shot["keyframes"]}
+        if any(identifier not in shot_ids for identifier in overview["source_shot_ids"]):
+            errors.append("overview: unresolved shot")
+        if overview["coverage"]["total_shots"] != len(doc["shots"]):
+            errors.append("overview: coverage total does not match shots")
+        expected_coverage = build_overview(doc)["coverage"]
+        for field, count in expected_coverage.items():
+            if overview["coverage"][field] != count:
+                errors.append(f"overview: {field} does not match current shot evidence")
+        for name, item in overview["analysis"].items():
+            if any(identifier not in frame_ids for identifier in item["evidence_ids"]):
+                errors.append(f"overview/{name}: unresolved evidence")
+            if item["run_id"] is not None and item["run_id"] not in run_ids:
+                errors.append(f"overview/{name}: unresolved run")
+            if any(identifier not in shot_ids for identifier in item.get("source_shot_ids", [])):
+                errors.append(f"overview/{name}: unresolved shot")
     return errors
+
+
+VISUAL_MEDIA = {"2d_animation", "3d_animation", "live_action", "mixed", "screen_capture", "graphic", "unknown"}
+
+
+def _has_semantic_claims(shot):
+    if shot["review"]["state"] == "rejected":
+        return False
+    for field in ("summary", "subjects", "actions", "tags", "visual_medium", "themes"):
+        item = shot["analysis"].get(field, {})
+        value = item.get("value")
+        if value and value != "unknown" and item.get("review_status") != "rejected":
+            return True
+    return False
+
+
+def build_overview(doc: dict) -> dict:
+    """Extractive, source-backed index; never infer an unseen whole-film plot."""
+    shots = doc["shots"]
+    analyzed = [shot for shot in shots if shot["status"] == "analyzed"]
+    semantic = [shot for shot in shots if _has_semantic_claims(shot)]
+    coverage = {"total_shots": len(shots), "analyzed_shots": len(analyzed), "semantic_shots": len(semantic),
+                "abstained_shots": sum(shot.get("extensions", {}).get("vision_status") == "abstained" for shot in shots),
+                "failed_shots": sum(shot["status"] == "failed" for shot in shots)}
+    status = "completed" if len(analyzed) == len(shots) else "partial" if analyzed or semantic else "measured"
+    result = {"status": status, "coverage": coverage, "analysis": {}, "source_shot_ids": [shot["id"] for shot in semantic],
+              "warnings": ["概括按已标注镜头做摘录汇总；叙事用途仍是原镜头推断，不代表经确认的整片剧情。"]}
+    if len(semantic) < len(shots):
+        result["warnings"].append(f"仅 {len(semantic)}/{len(shots)} 个镜头具有可用视觉语义，其余内容未知。")
+    def collect(field):
+        entries = []
+        for shot in semantic:
+            item = shot["analysis"].get(field, {})
+            value = item.get("value")
+            if value is not None and value != [] and value != "" and item.get("review_status") != "rejected":
+                entries.append((shot, item, value))
+        return entries
+    def make(field, value, entries):
+        ids = list(dict.fromkeys(identifier for _, item, _ in entries for identifier in item.get("evidence_ids", [])))
+        source_ids = list(dict.fromkeys(shot["id"] for shot, _, _ in entries))
+        output = claim(value, "inferred", None, ids, None)
+        output.update(source_shot_ids=source_ids, aggregation="extractive-source-claims")
+        result["analysis"][field] = output
+    summaries = collect("summary")
+    distinct, used = [], []
+    for shot, item, value in summaries:
+        if isinstance(value, str) and value not in distinct:
+            distinct.append(value)
+            used.append((shot, item, value))
+    # Evenly sample a bounded number of observed summaries across a long film.
+    if len(used) > 8:
+        used = [used[round(i * (len(used) - 1) / 7)] for i in range(8)]
+    summary = "；".join(f"镜头 {shot['index']}：{str(value)[:140]}" for shot, _, value in used) or None
+    if summary:
+        summary = f"已标注 {len(semantic)}/{len(shots)} 镜。" + summary
+    make("summary", summary, used)
+    for output_field, source_field in (("visual_medium", "visual_medium"), ("themes", "themes"), ("tags", "tags"), ("subjects", "subjects")):
+        entries = collect(source_field)
+        values, retained = [], []
+        for entry in entries:
+            value = entry[2]
+            options = value if isinstance(value, list) else [value]
+            valid = [item.strip()[:160] for item in options if isinstance(item, str) and item.strip() and (output_field != "visual_medium" or item in VISUAL_MEDIA - {"unknown"})]
+            if valid:
+                values.extend(valid)
+                retained.append(entry)
+        counts = Counter(values)
+        ranked = [name for name, _ in counts.most_common(40)]
+        make(output_field, ranked or None, retained)
+    narrative = collect("narrative_function")
+    narrative = [entry for entry in narrative if isinstance(entry[2], str)][:6]
+    value = "；".join(f"镜头 {shot['index']} 的用途推断：{text[:160]}" for shot, _, text in narrative) or None
+    make("narrative", value, narrative)
+    for field, item in doc.get("overview", {}).get("analysis", {}).items():
+        if item.get("origin") == "human" or item.get("review_status") in {"accepted", "edited"}:
+            result["analysis"][field] = deepcopy(item)
+    return result
 
 
 def export_shots_csv(doc: dict) -> str:

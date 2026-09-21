@@ -39,9 +39,26 @@
       "model": {"type": ["string", "null"]}, "started_at": {"type": "string"},
       "completed_at": {"type": ["string", "null"]}, "status": {"type": "string"}, "config": {"type": "object"}
     }}},
-    "history": {"type": "array"}, "warnings": {"type": "array"}, "extensions": {"type": "object"}
+    "history": {"type": "array"}, "warnings": {"type": "array"}, "extensions": {"type": "object"},
+    "overview": {"$ref": "#/$defs/overview"}
   },
   "$defs": {
+    "overview": {"type": "object", "required": ["status", "coverage", "analysis", "source_shot_ids", "warnings"], "properties": {
+      "status": {"enum": ["measured", "partial", "completed"]},
+      "coverage": {"type": "object", "required": ["total_shots", "analyzed_shots", "semantic_shots", "abstained_shots", "failed_shots"], "properties": {
+        "total_shots": {"type": "integer", "minimum": 1}, "analyzed_shots": {"type": "integer", "minimum": 0},
+        "semantic_shots": {"type": "integer", "minimum": 0}, "abstained_shots": {"type": "integer", "minimum": 0}, "failed_shots": {"type": "integer", "minimum": 0}
+      }},
+      "source_shot_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "warnings": {"type": "array", "items": {"type": "string"}},
+      "analysis": {"type": "object", "required": ["summary", "visual_medium", "themes", "narrative", "tags", "subjects"], "properties": {
+        "summary": {"allOf": [{"$ref": "#/$defs/claim"}, {"properties": {"value": {"type": ["string", "null"]}}}]},
+        "narrative": {"allOf": [{"$ref": "#/$defs/claim"}, {"properties": {"value": {"type": ["string", "null"]}}}]},
+        "visual_medium": {"allOf": [{"$ref": "#/$defs/claim"}, {"properties": {"value": {"type": ["array", "null"], "items": {"enum": ["2d_animation", "3d_animation", "live_action", "mixed", "screen_capture", "graphic", "unknown"]}, "uniqueItems": true}}}]},
+        "themes": {"allOf": [{"$ref": "#/$defs/claim"}, {"properties": {"value": {"type": ["array", "null"], "items": {"type": "string"}}}}]},
+        "tags": {"allOf": [{"$ref": "#/$defs/claim"}, {"properties": {"value": {"type": ["array", "null"], "items": {"type": "string"}}}}]},
+        "subjects": {"allOf": [{"$ref": "#/$defs/claim"}, {"properties": {"value": {"type": ["array", "null"], "items": {"type": "string"}}}}]}
+      }, "additionalProperties": {"$ref": "#/$defs/claim"}}
+    }},
     "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
     "claim": {"type": "object", "required": ["value", "origin", "confidence", "evidence_ids", "run_id", "review_status"], "properties": {
       "value": {}, "origin": {"enum": ["measured", "inferred", "human"]}, "confidence": {"$ref": "#/$defs/confidence"},

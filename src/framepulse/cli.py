@@ -32,6 +32,7 @@ def parser() -> argparse.ArgumentParser:
     vision.add_argument("--no-vision", action="store_true", help="仅本地测量，不调用 AI")
     analyze.add_argument("--provider-url", help="OpenAI-compatible /v1 URL；显式搭配 --vision")
     analyze.add_argument("--model")
+    analyze.add_argument("--profile", choices=["fast", "balanced", "detailed"], default="balanced")
     analyze.add_argument("--threshold", type=float, default=27.0)
     analyze.add_argument("--ocr", action="store_true", help="可选 RapidOCR 中文/英文证据帧文字识别")
     analyze.add_argument("--no-resume", action="store_true", help="禁用恢复；引擎仍应保护人工修订")
@@ -78,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
                                    provider_url=args.provider_url or config["provider_url"], model=args.model or config["model"],
                                    api_key=os.getenv("FRAMEPULSE_API_KEY"), threshold=args.threshold, resume=not args.no_resume,
                                    progress=lambda value: emit({"event": "progress", **value}, error=True),
-                                   cancel=cancelled.is_set, ocr=args.ocr)
+                                   cancel=cancelled.is_set, ocr=args.ocr, profile=args.profile)
             doc = read_document(output)
             errors = validate_document(doc)
             if errors:
@@ -130,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             from .server import create_app
             if not 1024 <= args.port <= 65535:
                 raise ValueError("端口必须在 1024 到 65535 之间")
-            app = create_app(args.data)
+            app = create_app(args.data, token=os.getenv("FRAMEPULSE_SERVER_TOKEN"))
             if args.open:
                 import webbrowser
                 threading.Timer(1, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()

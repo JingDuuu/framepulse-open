@@ -11,7 +11,8 @@ import threading
 import urllib.parse
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from typing import Literal
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
-from .config import provider_defaults
+from .config import Settings, discover_models, provider_defaults
+from .jobs import JobQueue
 from .locking import AssetBusyError, asset_lock
-from .protocol import (claim, export_shots_csv, export_web_annotations, now_iso,
+from .protocol import (build_overview, claim, export_shots_csv, export_web_annotations, now_iso,
                        read_document, stable_id, validate_document, write_document)
 
 
@@ -35,6 +37,32 @@ class AnalyzeRequest(BaseModel):
     model: str | None = None
     threshold: float = Field(default=27, ge=1, le=100)
     ocr: bool = False
+    profile: Literal["fast", "balanced", "detailed"] = "balanced"
+
+
+class QueueAddRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    paths: list[str] = Field(min_length=1, max_length=10000)
+    recursive: bool = True
+    vision: bool | None = None
+    provider_url: str | None = None
+    model: str | None = None
+    threshold: float = Field(default=27, ge=1, le=100)
+    ocr: bool = False
+    profile: Literal["fast", "balanced", "detailed"] | None = None
+
+
+class ConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    vision: bool | None = None
+    profile: Literal["fast", "balanced", "detailed"] | None = None
+
+
+class PickRequest(BaseModel):
+    mode: Literal["files", "folder"] = "files"
 
 
 class ShotPatch(BaseModel):
@@ -59,19 +87,31 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
     web = Path(__file__).parent / "web"
     write_token = token or secrets.token_urlsafe(32)
     defaults = provider_defaults()
-    jobs: dict[str, dict] = {}
-    events: dict[str, threading.Event] = {}
+    settings = Settings(root / "settings.local.json", defaults)
+    queue = JobQueue(root, settings)
+    jobs = queue.jobs
     source_fingerprints: dict[str, tuple] = {}
-    lock = threading.RLock()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="framepulse")
-    app = FastAPI(title="FramePulse local review", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+    lock = queue.condition
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        queue.close()
+
+    app = FastAPI(title="FramePulse local review", version=__version__, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.data_dir = root
     app.state.jobs = jobs
+    app.state.queue = queue
+    app.state.settings = settings
     app.state.token = write_token
 
     @app.exception_handler(AssetBusyError)
     async def asset_busy(request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(OSError)
+    async def storage_error(request, exc):
+        return JSONResponse({"detail": "无法读写本地数据，请检查磁盘空间、文件位置和写入权限。"}, status_code=503)
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
@@ -113,7 +153,25 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
 
     @app.get("/api/config")
     def config():
-        return {"token": write_token, **defaults}
+        return {"token": write_token, **settings.snapshot()}
+
+    @app.post("/api/config")
+    def update_config(request: ConfigRequest):
+        try:
+            values = request.model_dump(exclude_unset=True)
+            if any(v is None for k, v in values.items() if k != "api_key"):
+                raise ValueError("配置字段不能为空")
+            return {"token": write_token, **settings.update(values)}
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+
+    @app.get("/api/models")
+    def models(provider_url: str | None = None):
+        url = provider_url or settings.snapshot()["provider_url"]
+        try:
+            return discover_models(url, settings.key_for(url))
+        except ValueError as error:
+            raise HTTPException(422, str(error))
 
     @app.get("/api/assets")
     def list_assets():
@@ -129,7 +187,7 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
                                "analyzed_count": sum(s["status"] == "analyzed" for s in shots),
                                "reviewed_count": sum(s["review"]["state"] == "accepted" for s in shots),
                                "thumbnail": f"/api/assets/{asset_id}/files/{frame['uri']}" if frame else None,
-                               "updated_at": doc["updated_at"], "warnings": doc.get("warnings", []),
+                               "updated_at": doc["updated_at"], "warnings": doc.get("warnings", []), "overview": doc.get("overview"),
                                "status": "analyzed" if all(s["status"] == "analyzed" for s in shots) else "measured"})
             except (OSError, ValueError, KeyError):
                 continue
@@ -174,74 +232,73 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
             raise HTTPException(404, "证据帧不存在")
         return FileResponse(target)
 
-    def run_job(job_id: str, request: AnalyzeRequest):
-        from .engine import analyze_asset
-        with lock:
-            if events[job_id].is_set():
-                jobs[job_id]["state"] = "cancelled"
-                return
-            jobs[job_id]["state"] = "running"
+    def request_options(request):
+        config = settings.snapshot()
+        values = request.model_dump(exclude={"paths", "recursive", "path"})
+        values["provider_url"] = values.get("provider_url") or config["provider_url"]
+        values["model"] = values.get("model") or config["model"]
+        values["profile"] = values.get("profile") or config["profile"]
+        if values.get("vision") is None:
+            values["vision"] = bool(config.get("vision")) and values["provider_url"] == config["provider_url"]
+        if values["vision"]:
+            from .providers import provider_endpoint
+            try:
+                provider_endpoint(values["provider_url"])
+            except ValueError as error:
+                raise HTTPException(422, str(error))
+            if not values["model"]:
+                raise HTTPException(422, "请先选择视觉模型")
+        return values
 
-        def progress(value):
-            with lock:
-                jobs[job_id]["progress"] = value
-
+    @app.post("/api/queue/add")
+    def add_queue(request: QueueAddRequest):
         try:
-            path = analyze_asset(Path(request.path).resolve(), root, vision=request.vision,
-                                 provider_url=request.provider_url or defaults["provider_url"],
-                                 model=request.model or defaults["model"], api_key=os.getenv("FRAMEPULSE_API_KEY"),
-                                 threshold=request.threshold, ocr=request.ocr, resume=True,
-                                 progress=progress, cancel=events[job_id].is_set)
-            doc = read_document(path)
-            validation = validate_document(doc)
-            if validation:
-                raise ValueError("记录未通过协议校验：" + "; ".join(validation[:3]))
-            with lock:
-                jobs[job_id].update(state="cancelled" if events[job_id].is_set() else "completed", asset_id=Path(path).parent.name)
-                if request.vision and any(s["status"] == "failed" for s in doc["shots"]):
-                    jobs[job_id].update(state="failed", error="部分镜头分析失败，已保存完成结果；重新分析可继续")
-                if request.ocr and next((r.get("failed_shots", 0) for r in reversed(doc["runs"]) if r["kind"] == "ocr"), 0):
-                    jobs[job_id].update(state="failed", error="部分文字识别失败，已保存测量与已完成结果")
-        except Exception as error:
-            with lock:
-                jobs[job_id].update(state="cancelled" if events[job_id].is_set() else "failed", error=str(error)[:800])
-        finally:
-            with lock:
-                jobs[job_id]["finished_at"] = now_iso()
+            return queue.add(request.paths, request_options(request), request.recursive)
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+
+    @app.post("/api/queue/{action}")
+    def control_queue(action: str):
+        try:
+            return queue.control(action)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
 
     @app.post("/api/analyze")
     def analyze(request: AnalyzeRequest):
         source = Path(request.path).expanduser().resolve()
         if not source.is_file():
             raise HTTPException(400, "找不到这个文件，请选择本机视频或图片")
-        request.path = str(source)
-        with lock:
-            if any(j["path"] == str(source) and j["state"] in ("queued", "running") for j in jobs.values()):
-                raise HTTPException(409, "这个素材正在分析中")
-            if sum(j["state"] in ("queued", "running") for j in jobs.values()) >= 16:
-                raise HTTPException(429, "等待中的任务过多，请稍后再试")
-            job_id = uuid.uuid4().hex
-            jobs[job_id] = {"id": job_id, "path": str(source), "name": source.name, "state": "queued",
-                            "created_at": now_iso(), "progress": {"phase": "queued", "current": 0, "total": 1, "message": "等待分析"}}
-            events[job_id] = threading.Event()
-            executor.submit(run_job, job_id, request)
-        return {"id": job_id}
+        result = queue.add([str(source)], request_options(request))
+        if not result["jobs"]:
+            raise HTTPException(409, result["skipped"][0]["reason"] if result["skipped"] else "没有可分析素材")
+        queue.control("start")
+        return {"id": result["jobs"][0]["id"]}
 
     @app.get("/api/jobs")
     def list_jobs():
-        with lock:
-            return {"jobs": copy.deepcopy(list(jobs.values())[-50:])}
+        return queue.snapshot()
 
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel(job_id: str):
-        with lock:
-            if job_id not in events:
-                raise HTTPException(404, "任务不存在")
-            events[job_id].set()
-        return {"ok": True}
+        try:
+            queue.cancel(job_id)
+            return {"ok": True}
+        except KeyError:
+            raise HTTPException(404, "任务不存在")
+
+    @app.post("/api/jobs/{job_id}/retry")
+    def retry(job_id: str):
+        try:
+            queue.retry(job_id)
+            return {"ok": True}
+        except KeyError:
+            raise HTTPException(404, "任务不存在")
+        except ValueError as error:
+            raise HTTPException(409, str(error))
 
     @app.post("/api/pick")
-    def pick():
+    def pick(request: PickRequest | None = None):
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -249,10 +306,14 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
             window.withdraw()
             window.attributes("-topmost", True)
             try:
-                selected = filedialog.askopenfilename(title="选择视频或图片", filetypes=[("视频和图片", "*.mp4 *.mov *.mkv *.avi *.mxf *.webm *.m4v *.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("所有文件", "*.*")])
+                if request and request.mode == "folder":
+                    folder = filedialog.askdirectory(title="选择素材文件夹")
+                    paths = [folder] if folder else []
+                else:
+                    paths = list(filedialog.askopenfilenames(title="选择视频或图片", filetypes=[("视频和图片", "*.mp4 *.mov *.mkv *.avi *.mxf *.webm *.m4v *.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("所有文件", "*.*")]))
             finally:
                 window.destroy()
-            return {"path": selected or None}
+            return {"paths": paths, "path": paths[0] if paths else None}
         except Exception:
             raise HTTPException(503, "文件选择器不可用，请直接粘贴文件的完整路径")
 
@@ -261,7 +322,7 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
         with lock, asset_lock(bundle(asset_id)):
             doc = document(asset_id)
             source = str(path_from_uri(doc["asset"]["source"]["uri"]).resolve())
-            if any(j["path"] == source and j["state"] in ("queued", "running") for j in jobs.values()):
+            if any(j["path"] == source and j["state"] in ("pending", "queued", "running") for j in jobs.values()):
                 raise HTTPException(409, "素材仍在分析，完成后即可修订")
             if patch.revision != doc["revision"]:
                 raise HTTPException(409, "记录已更新，请重新载入后再保存")
@@ -294,6 +355,7 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
                 for group in ("analysis", "emotion"):
                     for item in shot[group].values():
                         item["review_status"] = patch.review["state"]
+            doc["overview"] = build_overview(doc)
             errors = validate_document(doc)
             if errors:
                 raise HTTPException(422, "；".join(errors[:5]))

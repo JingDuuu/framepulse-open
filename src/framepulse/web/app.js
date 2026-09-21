@@ -1,20 +1,22 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = {token: null, config: {}, assets: [], document: null, assetId: null, shotIndex: 0, keyframeId: null, jobs: [], jobStates: new Map(), submittedJobs: new Map(), dirty: false, busy: false, drawing: false, draftRegion: null, loadedAsset: null, loadingAsset: null, loadSequence: 0, libraryLoadSequence: 0, mediaGeneration: 0, seekSequence: 0, pendingSeek: null, online: false};
+const state = {token: null, config: {}, assets: [], document: null, assetId: null, shotIndex: 0, keyframeId: null, activeRegionId: null, labelsVisible: true, jobs: [], queue: {state:"idle"}, jobStates: new Map(), submittedJobs: new Map(), dirty: false, busy: false, drawing: false, draftRegion: null, loadedAsset: null, loadingAsset: null, loadSequence: 0, libraryLoadSequence: 0, mediaGeneration: 0, seekSequence: 0, pendingSeek: null, online: false};
+const mediumNames = {"2d_animation":"二维动画","3d_animation":"三维动画","live_action":"实拍","mixed":"混合媒介","screen_capture":"屏幕录制","graphic":"动态图形 / 平面","unknown":"不确定"};
 const visualFields = [
+  ["visual_medium", "影像类型", "未标记", true],
   ["shot_size", "景别", "例如：中近景"], ["camera_angle", "机位角度", "例如：低机位仰拍"],
   ["camera_movement", "摄影机运动", "例如：缓慢推近", true], ["composition", "构图与空间", "主体位置、纵深与视线", true],
   ["lighting", "光线", "方向、软硬、明暗关系", true], ["color", "色彩", "色调、色温与色彩关系", true]
 ];
 const storyFields = [
   ["subjects", "主体", "人物、物体及其关系"], ["actions", "动作与调度", "主体行为与画面中的变化"],
-  ["setting", "场景", "环境、时间与空间"], ["narrative_function", "叙事功能", "这个镜头如何推进表达"], ["tags", "检索标签", "以逗号分隔，例如：逆光, 人物, 城市"]
+  ["setting", "场景", "环境、时间与空间"], ["narrative_function", "叙事功能", "这个镜头如何推进表达"], ["themes", "主题", "主题词，以逗号分隔"], ["tags", "检索标签", "以逗号分隔，例如：逆光, 人物, 城市"]
 ];
 const emotionFields = [["tension", "张力"], ["valence", "情绪效价"], ["arousal", "唤醒度"]];
 const originNames = {measured: "测量", inferred: "AI 推断", human: "人工"};
 const reviewNames = {unreviewed: "未确认", accepted: "已确认", edited: "已编辑", rejected: "待重做"};
-const jobNames = {queued: "排队中", running: "分析中", completed: "已完成", failed: "分析失败", cancelled: "已取消"};
+const jobNames = {pending: "待处理", queued: "排队中", running: "分析中", completed: "已完成", failed: "分析失败", cancelled: "已取消"};
 let pollTimer, toastTimer, regionPointer, lastTimelineUpdate = 0;
 
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
@@ -22,6 +24,14 @@ function currentShot() { return state.document?.shots?.[state.shotIndex] ?? null
 function currentFrame() { const frames = currentShot()?.keyframes || []; return frames.find(frame => frame.id === state.keyframeId) || frames[0] || null; }
 function formatTime(us = 0) { const ms = Math.max(0, Math.round(Number(us || 0) / 1000)), s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2,"0")}:${String(s % 60).padStart(2,"0")}.${String(ms % 1000).padStart(3,"0")}`; }
 function durationLabel(us) { if (us == null) return "图片"; const sec = us / 1e6; return sec >= 60 ? `${Math.floor(sec / 60)} 分 ${Math.round(sec % 60)} 秒` : `${sec.toFixed(sec < 10 ? 1 : 0)} 秒`; }
+function formatProgress(progress = {}) {
+  const current = Number(progress.current), total = Number(progress.total);
+  if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 0) return "";
+  if (progress.phase === "detect") return `${formatTime(current).split(".")[0]} / ${formatTime(total).split(".")[0]}`;
+  if (["hash","hashing"].includes(progress.phase)) return `${(current / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`;
+  const unit = ["vision","ocr","complete"].includes(progress.phase) ? " 镜头" : ["keyframes","frames"].includes(progress.phase) ? " 帧" : "";
+  return `${Math.round(current)} / ${Math.round(total)}${unit}`;
+}
 function shortName(path) { return String(path || "素材分析").split(/[\\/]/).pop(); }
 function shotNumber(index) { return String(index + 1).padStart(2,"0"); }
 function frameUrl(frame) { return frame ? `/api/assets/${encodeURIComponent(state.assetId)}/files/${String(frame.uri).split("/").map(encodeURIComponent).join("/")}` : ""; }
@@ -87,7 +97,7 @@ async function loadAsset(id, {keepPosition = false, force = false, shotId = null
     state.assetId = id; state.document = doc; state.dirty = false;
     const requestedShot = shotId ? doc.shots.findIndex(shot => shot.id === shotId) : -1;
     state.shotIndex = shotId ? Math.max(0, requestedShot) : keepPosition ? Math.max(0, doc.shots.findIndex(shot => shot.id === previousShotId)) : 0;
-    state.keyframeId = currentShot()?.keyframes?.[0]?.id || null;
+    state.keyframeId = currentShot()?.keyframes?.[0]?.id || null; state.activeRegionId = null;
     stopDrawing(); renderAsset(!keepPosition || !!shotId); renderLibrary(); updateLocation();
     if (shotId && requestedShot < 0) showToast("链接中的镜头不存在，已打开该素材的第一个镜头。", true);
   } catch (error) { if (sequence === state.loadSequence) showToast(error.message, true); }
@@ -114,6 +124,7 @@ function renderAsset(resetPlayback = true) {
     if (isVideo) { $("video").src = mediaUrl; $("video").load(); } else $("image").src = mediaUrl;
   }
   $("playButton").disabled = !isVideo; $("seek").disabled = !isVideo;
+  $("playbackSpeed").disabled = !isVideo; $("muteButton").disabled = !isVideo || !tech.has_audio; $("volume").disabled = !isVideo || !tech.has_audio; updateAudioControls();
   $("seek").max = Math.max(0.001, (tech.duration_us || 0) / 1e6);
   $("duration").textContent = isVideo ? formatTime(tech.duration_us) : "静态图片";
   const playbackTime = isVideo ? state.pendingSeek?.time ?? $("video").currentTime : 0;
@@ -123,7 +134,7 @@ function renderAsset(resetPlayback = true) {
   const fps = tech.frame_rate?.denominator ? tech.frame_rate.numerator / tech.frame_rate.denominator : null;
   $("assetTech").textContent = `${tech.width || "?"} × ${tech.height || "?"}${fps ? ` · ${Number(fps.toFixed(3))} fps` : ""}${tech.has_audio ? " · 有音轨" : isVideo ? " · 无音轨" : ""}`;
   $("fullscreenButton").disabled = false;
-  renderShotStrip(); renderInspector(); renderTimeline(); fitMedia();
+  renderShotStrip(); renderInspector(); renderTimeline(); renderOverview(); fitMedia();
   if (resetPlayback) seekToShot(false, {anchor:"start"}); else renderRegions();
 }
 function renderShotStrip() {
@@ -144,7 +155,7 @@ function selectShot(index, {seek = true, scroll = true, ask = true} = {}) {
   if (index !== state.shotIndex && ask && !mayDiscard()) return;
   // Selecting a shot is a newer navigation intent than an in-flight asset fetch.
   if (state.loadingAsset && ask) { state.loadSequence++; setAssetLoading(null); }
-  if (index !== state.shotIndex) { state.shotIndex = index; state.dirty = false; state.keyframeId = currentShot()?.keyframes?.[0]?.id || null; stopDrawing(); renderInspector(); }
+  if (index !== state.shotIndex) { state.shotIndex = index; state.dirty = false; state.keyframeId = currentShot()?.keyframes?.[0]?.id || null; state.activeRegionId = null; stopDrawing(); renderInspector(); }
   updateShotSelection(scroll); if (seek) seekToShot(false, {anchor:"start"}); renderTimeline(); renderRegions(); updateLocation();
 }
 function currentMediaMatches() {
@@ -184,6 +195,7 @@ function originMarkup(claim) {
 }
 function makeField([field, label, placeholder, wide], shot, multiline = false) {
   const claim = shot.analysis?.[field], value = claimText(claim?.value);
+  if (field === "visual_medium") return `<div class="field-block wide"><label for="field-${field}">${label}<span>${originMarkup(claim)}</span></label><select id="field-${field}" data-analysis="${field}"><option value="">未标记</option>${Object.entries(mediumNames).map(([key,name]) => `<option value="${key}"${key === value ? " selected" : ""}>${name}</option>`).join("")}</select></div>`;
   return `<div class="field-block${wide ? " wide" : ""}"><label for="field-${field}">${label}<span>${originMarkup(claim)}</span></label>${multiline || wide ? `<textarea id="field-${field}" data-analysis="${field}" rows="${field === "narrative_function" ? 2 : 1}" placeholder="${escapeHtml(placeholder)}">${escapeHtml(value)}</textarea>` : `<input id="field-${field}" data-analysis="${field}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}">`}</div>`;
 }
 function renderInspector() {
@@ -205,12 +217,12 @@ function renderInspector() {
   const evidenceIds = [...new Set(claims.flatMap(claim => claim.evidence_ids || []))];
   const runs = (state.document.runs || []).filter(run => claims.some(claim => claim.run_id === run.id));
   $("evidenceInfo").innerHTML = `<div class="evidence-row"><b>边界方法</b><br>${escapeHtml(boundary.method || "未知")}${typeof boundary.confidence === "number" ? ` · ${Math.round(boundary.confidence * 100)}%` : ""}</div><div class="evidence-row"><b>关键帧证据</b><br>${evidenceIds.length || 0} 个引用 · ${shot.keyframes?.length || 0} 张可用帧</div>${(shot.keyframes || []).map(frame => `<div class="evidence-row"><button type="button" class="text-button" data-frame="${escapeHtml(frame.id)}">${frame.time_us == null ? "查看图片" : `跳转证据帧 ${formatTime(frame.time_us)}`}</button></div>`).join("")}${runs.map(run => `<div class="evidence-row"><b>${escapeHtml(run.provider || run.kind)}</b><br>${escapeHtml(run.model || "本地测量")}<br>${escapeHtml(run.completed_at || run.started_at || "")}</div>`).join("")}<div class="evidence-row">AI 置信值为模型自报，未经校准。关键帧并不等于穷尽镜头全部内容。</div>`;
-  renderRegionList(); updateShotSelection(false); setDirty(false); $("annotateButton").disabled = !currentFrame(); $("addRegion").disabled = !currentFrame();
+  renderRegionList(); renderRegionChips(); updateShotSelection(false); setDirty(false); $("annotateButton").disabled = !currentFrame(); $("addRegion").disabled = !currentFrame();
 }
 function setDirty(dirty = true) { state.dirty = dirty; $("editStatus").textContent = dirty ? "有未保存的修改" : "所有改动保存到记录文件"; $("editStatus").classList.toggle("dirty", dirty); }
 function parseField(field, text, original) {
   const value = text.trim(); if (!value) return null;
-  if (field === "tags" || Array.isArray(original) && original.every(item => typeof item === "string")) return value.split(/[,，、\n]+/).map(item => item.trim()).filter(Boolean);
+  if (["tags","themes"].includes(field) || Array.isArray(original) && original.every(item => typeof item === "string")) return value.split(/[,，、\n]+/).map(item => item.trim()).filter(Boolean);
   if (original && typeof original === "object") { try { return JSON.parse(value); } catch { throw new Error("结构化字段需要保留有效 JSON 格式。请核对主体、动作或场景等字段。"); } }
   return value;
 }
@@ -242,7 +254,7 @@ async function saveShot({reviewState, regions, success = "镜头记录已保存"
     if (Object.keys(patch).length === 1) { showToast("当前记录没有待保存的修改"); setDirty(false); return true; }
     setSaving(true);
     const doc = await api(`/api/assets/${encodeURIComponent(assetId)}/shots/${encodeURIComponent(shotId)}`, {method:"PATCH", body:JSON.stringify(patch)});
-    if (state.assetId === assetId) { state.document = doc; state.shotIndex = Math.max(0, doc.shots.findIndex(shot => shot.id === shotId)); renderInspector(); renderShotStrip(); renderRegions(); renderTimeline(); $("recordStatus").textContent = `帧脉记录 v${doc.spec_version} · 修订 ${doc.revision}`; }
+    if (state.assetId === assetId) { state.document = doc; state.shotIndex = Math.max(0, doc.shots.findIndex(shot => shot.id === shotId)); renderInspector(); renderShotStrip(); renderRegions(); renderTimeline(); renderOverview(); $("recordStatus").textContent = `帧脉记录 v${doc.spec_version} · 修订 ${doc.revision}`; }
     showToast(success); loadAssets().catch(() => {}); return true;
   } catch (error) { showToast(error.message, true); return false; } finally { setSaving(false); }
 }
@@ -258,17 +270,34 @@ function fitMedia() {
 function renderRegions() {
   const shot = currentShot(); if (!shot) return;
   const frame = currentFrame();
-  const isAtFrame = state.document.asset.kind === "image" || (Math.abs($("video").currentTime * 1e6 - (frame?.time_us ?? 0)) <= 200000 && $("video").paused);
-  $("regionOverlay").innerHTML = isAtFrame || state.drawing ? (shot.regions || []).filter(region => region.keyframe_id === frame?.id).map(region => `<div class="region-box" style="left:${region.xywh[0] * 100}%;top:${region.xywh[1] * 100}%;width:${region.xywh[2] * 100}%;height:${region.xywh[3] * 100}%"><span>${escapeHtml(region.label)}</span></div>`).join("") : "";
+  const isAtFrame = state.document.asset.kind === "image" || (Math.abs($("video").currentTime * 1e6 - (frame?.time_us ?? 0)) <= 1000 && $("video").paused);
+  $("regionFrameStatus").textContent = !state.labelsVisible ? "标记已隐藏" : isAtFrame ? `证据帧 ${frame?.time_us == null ? "图片" : formatTime(frame.time_us)} · 非追踪` : "点标签看证据帧 · 非追踪";
+  if (regionPointer) return;
+  $("regionOverlay").innerHTML = state.labelsVisible && (isAtFrame || state.drawing) ? (shot.regions || []).filter(region => region.keyframe_id === frame?.id).map(region => `<div class="region-box${region.id === state.activeRegionId ? " active" : ""}" role="button" tabindex="0" data-region-highlight="${escapeHtml(region.id)}" aria-label="高亮 ${escapeHtml(region.label)} · ${escapeHtml(regionSource(region))}" style="left:${region.xywh[0] * 100}%;top:${region.xywh[1] * 100}%;width:${region.xywh[2] * 100}%;height:${region.xywh[3] * 100}%"><span>${escapeHtml(region.label)} · ${escapeHtml(regionSource(region))}</span></div>`).join("") : "";
+  updateRegionHighlight();
+}
+function updateRegionHighlight() {
+  document.querySelectorAll("[data-region-id]").forEach(node => { const active = node.dataset.regionId === state.activeRegionId; node.classList.toggle("active",active); node.setAttribute("aria-pressed",String(active)); });
+  $("regionChips").classList.toggle("labels-off",!state.labelsVisible);
+}
+function regionSource(region) { return originNames[region.origin] || (region.extensions?.source === "vision" ? "AI 推断" : "来源未标记"); }
+function renderRegionChips() {
+  const shot = currentShot(), regions = shot?.regions || [];
+  $("regionChips").innerHTML = regions.length ? regions.map((region,index) => { const frame = shot.keyframes.find(frame => frame.id === region.keyframe_id); return `<button type="button" class="region-chip${region.id === state.activeRegionId ? " active" : ""}" data-region-chip="${index}" data-region-id="${escapeHtml(region.id)}" aria-pressed="${region.id === state.activeRegionId}" title="${escapeHtml(regionSource(region))}；点击暂停并跳转对应关键帧；区域不是跨帧追踪"><span>${escapeHtml(region.label || "未命名区域")}</span><em class="region-source">${escapeHtml(regionSource(region))}</em><small>${frame?.time_us == null ? "图片" : formatTime(frame.time_us)}</small></button>`; }).join("") : '<span>此镜头没有区域标签。可用「框选画面区域」添加；不会根据语义凭空补框。</span>';
+}
+function selectRegion(index) {
+  const region = currentShot()?.regions?.[index]; if (!region || state.busy || state.loadingAsset) return;
+  state.keyframeId = region.keyframe_id; state.activeRegionId = region.id; state.labelsVisible = true; $("labelsVisible").checked = true;
+  seekToShot(true); renderRegions(); updateRegionHighlight();
 }
 function renderRegionList() {
   const regions = currentShot()?.regions || [];
-  $("regionList").innerHTML = regions.length ? regions.map((region, index) => `<div class="region-item"><button type="button" data-region-jump="${index}">${escapeHtml(region.label || "未命名区域")}<small>${region.xywh.map(value => Number(value).toFixed(3)).join(" / ")}</small></button><button type="button" class="icon-button" data-region-delete="${index}" title="删除区域" aria-label="删除 ${escapeHtml(region.label)}">×</button></div>`).join("") : '<p class="field-hint">尚无画面区域标记</p>';
+  $("regionList").innerHTML = regions.length ? regions.map((region, index) => `<div class="region-item${region.id === state.activeRegionId ? " active" : ""}" data-region-id="${escapeHtml(region.id)}"><button type="button" data-region-jump="${index}">${escapeHtml(region.label || "未命名区域")}<small>${region.xywh.map(value => Number(value).toFixed(3)).join(" / ")}</small></button><button type="button" class="icon-button" data-region-delete="${index}" title="删除区域" aria-label="删除 ${escapeHtml(region.label)}">×</button></div>`).join("") : '<p class="field-hint">尚无画面区域标记</p>';
 }
 function startDrawing() {
   if (!currentFrame() || state.busy || state.loadingAsset) return;
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  seekToShot(true); state.drawing = true; $("regionOverlay").classList.add("drawing"); $("annotationHint").hidden = false; $("annotateButton").classList.add("active"); renderRegions();
+  state.labelsVisible = true; $("labelsVisible").checked = true; seekToShot(true); state.drawing = true; $("regionOverlay").classList.add("drawing"); $("annotationHint").hidden = false; $("annotateButton").classList.add("active"); renderRegions();
 }
 function stopDrawing() { state.drawing = false; regionPointer = null; $("regionOverlay").classList.remove("drawing"); $("annotationHint").hidden = true; $("annotateButton").classList.remove("active"); $("regionOverlay").querySelector(".draft")?.remove(); }
 function normalizedPointer(event) { const rect = $("regionOverlay").getBoundingClientRect(); return [Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)), Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))]; }
@@ -294,9 +323,28 @@ $("regionForm").addEventListener("submit", async event => { event.preventDefault
 $("regionDialog").addEventListener("close", () => { state.draftRegion = null; stopDrawing(); renderRegions(); });
 $("regionList").addEventListener("click", async event => {
   const jump = event.target.closest("[data-region-jump]"), remove = event.target.closest("[data-region-delete]");
-  if (jump) { const region = currentShot().regions[Number(jump.dataset.regionJump)]; state.keyframeId = region.keyframe_id; seekToShot(true); renderRegions(); }
+  if (jump) selectRegion(Number(jump.dataset.regionJump));
   if (remove && !state.busy) { const index = Number(remove.dataset.regionDelete); if (window.confirm(`删除区域「${currentShot().regions[index].label}」？`)) await saveShot({regions:currentShot().regions.filter((_,i) => i !== index),success:"画面区域已删除"}); }
 });
+$("regionChips").addEventListener("click",event => { const button = event.target.closest("[data-region-chip]"); if (button) selectRegion(Number(button.dataset.regionChip)); });
+$("labelsVisible").addEventListener("change",() => { state.labelsVisible = $("labelsVisible").checked; if (!state.labelsVisible) stopDrawing(); renderRegions(); });
+$("regionOverlay").addEventListener("click",event => { if (state.drawing) return; const box = event.target.closest("[data-region-highlight]"); if (box) { state.activeRegionId = box.dataset.regionHighlight; renderRegions(); } });
+$("regionOverlay").addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { const box = event.target.closest("[data-region-highlight]"); if (box) { event.preventDefault(); event.stopPropagation(); state.activeRegionId = box.dataset.regionHighlight; renderRegions(); } } });
+
+function renderOverview() {
+  $("assetOverview").hidden = !state.document;
+  const overview = state.document?.overview, coverage = overview?.coverage || {}, analysis = overview?.analysis || {};
+  const source = Object.values(analysis).some(claim => claim?.value != null && claim.origin === "inferred") ? "AI 推断" : coverage.semantic_shots ? "语义记录" : "仅测量";
+  $("overviewCoverage").textContent = overview ? `${coverage.semantic_shots || 0} / ${coverage.total_shots || state.document.shots.length} 镜 · ${source}` : "尚无整片记录";
+  $("overviewCoverage").title = overview ? `${overview.status === "completed" ? "分析完成" : overview.status === "partial" ? "部分分析完成" : "技术测量完成"}；分析状态不代表人工确认，请核对证据。` : "尚未生成整片记录";
+  const summary = claimText(analysis.summary?.value), narrative = claimText(analysis.narrative?.value);
+  const mediums = Array.isArray(analysis.visual_medium?.value) ? analysis.visual_medium.value : [];
+  const tags = [...new Set([...(Array.isArray(analysis.themes?.value) ? analysis.themes.value : []),...(Array.isArray(analysis.tags?.value) ? analysis.tags.value : [])])].filter(value => typeof value === "string");
+  const mediumLabel = mediums.map(value => mediumNames[value] || value).join(" / ");
+  $("overviewSummaryTags").innerHTML = `${mediumLabel ? `<span class="overview-tag medium" title="${escapeHtml(mediumLabel)}">${escapeHtml(mediumLabel)}</span>` : ""}${tags.slice(0,3).map(value => `<span class="overview-tag" title="${escapeHtml(value)}">${escapeHtml(value)}</span>`).join("")}`;
+  $("overviewSummaryTags").title = [mediumLabel,...tags].filter(Boolean).join(" · ");
+  $("overviewBody").innerHTML = `<p class="overview-summary">${escapeHtml(summary || "尚无整片语义概括。完成 AI 内容分析后，这里会汇总已分析镜头的内容。")}</p>${summary ? `<div class="overview-meta">${originMarkup(analysis.summary)}<span>基于镜头记录汇总，仍需核对证据</span></div>` : ""}<div class="overview-tags">${mediums.map(value => `<span class="overview-tag medium">${escapeHtml(mediumNames[value] || value)}</span>`).join("")}${tags.map(value => `<span class="overview-tag">${escapeHtml(value)}</span>`).join("")}</div>${narrative ? `<p class="overview-narrative">${escapeHtml(narrative)}</p>` : ""}${overview?.warnings?.length ? `<p class="overview-warning">${escapeHtml(overview.warnings.map(item => typeof item === "string" ? item : JSON.stringify(item)).join("；"))}</p>` : ""}`;
+}
 
 function renderTimeline() {
   const shots = state.document?.shots || []; if (!shots.length) return;
@@ -349,6 +397,16 @@ async function togglePlayback() {
   stopDrawing();
   if ($("video").paused) { try { await $("video").play(); } catch(error) { showToast(`视频无法播放：${error.message}`,true); } } else $("video").pause();
 }
+function updateAudioControls() {
+  const video = $("video"), hasAudio = state.document?.asset.kind === "video" && state.document.asset.technical?.has_audio;
+  $("muteButton").textContent = !hasAudio ? "无音轨" : video.muted || video.volume === 0 ? "已静音" : "声音开";
+  $("muteButton").setAttribute("aria-label", video.muted || video.volume === 0 ? "取消静音" : "静音"); $("muteButton").setAttribute("aria-pressed",String(video.muted || video.volume === 0));
+  $("volume").value = video.muted ? 0 : video.volume; $("playbackSpeed").value = String(video.playbackRate || 1);
+}
+$("muteButton").addEventListener("click",() => { const video = $("video"), unmute = video.muted || video.volume === 0; if (unmute && video.volume === 0) video.volume = .5; video.muted = !unmute; updateAudioControls(); });
+$("volume").addEventListener("input",() => { const video = $("video"); video.volume = Math.max(0,Math.min(1,Number($("volume").value))); video.muted = video.volume === 0; updateAudioControls(); });
+$("playbackSpeed").addEventListener("change",() => { const rate = Number($("playbackSpeed").value); $("video").defaultPlaybackRate = rate; $("video").playbackRate = rate; });
+$("video").addEventListener("volumechange",updateAudioControls); $("video").addEventListener("ratechange",updateAudioControls);
 $("video").addEventListener("timeupdate",onTimeUpdate);
 $("video").addEventListener("play",() => { $("playButton").textContent = "Ⅱ"; $("playButton").setAttribute("aria-label","暂停"); renderRegions(); });
 $("video").addEventListener("pause",() => { $("playButton").textContent = "▶"; $("playButton").setAttribute("aria-label","播放"); renderRegions(); });
@@ -367,7 +425,7 @@ $("nextShot").addEventListener("click",() => selectShot(state.shotIndex+1));
 $("fullscreenButton").addEventListener("click",async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await $("mediaStage").requestFullscreen(); } catch { showToast("当前浏览器不支持全屏预览",true); } });
 $("shotStrip").addEventListener("click",event => { const button = event.target.closest("[data-shot]"); if (button) selectShot(Number(button.dataset.shot),{scroll:false}); });
 $("timeline").addEventListener("click",event => { const rect = event.target.closest("[data-timeline-shot]"); if (rect) selectShot(Number(rect.dataset.timelineShot)); });
-$("assetList").addEventListener("click",event => { const button = event.target.closest("[data-asset]"); if (button) loadAsset(button.dataset.asset); });
+$("assetList").addEventListener("click",event => { const button = event.target.closest("[data-asset]"); if (button) { window.framepulseQueue?.showReview(); loadAsset(button.dataset.asset); } });
 $("assetSearch").addEventListener("input",renderLibrary);
 $("refreshLibrary").addEventListener("click",async () => { try { if (state.dirty && !mayDiscard()) return; if (state.dirty) setDirty(false); await loadAssets({autoSelect:true,refreshDocument:true}); showToast("素材库已刷新"); } catch(error) { showToast(error.message,true); } });
 $("inspectorForm").addEventListener("input",() => setDirty());
@@ -380,23 +438,23 @@ $("addRegion").addEventListener("click",startDrawing);
 $("annotationCancel").addEventListener("click",stopDrawing);
 
 function renderJobs() {
-  const jobs = state.jobs, active = jobs.filter(job => ["queued","running"].includes(job.state));
-  $("jobCount").textContent = active.length ? `${active.length} 进行中` : jobs.length;
+  window.framepulseQueue?.render();
+  const jobs = state.jobs, active = jobs.filter(job => ["pending","queued","running"].includes(job.state));
+  $("jobCount").textContent = active.length ? `${active.length} 待处理 / 处理中` : jobs.length;
   if (!jobs.length) { $("jobList").innerHTML = '<p class="queue-empty">等待新的影像</p>'; return; }
-  $("jobList").innerHTML = [...jobs].reverse().sort((a,b) => Number(["queued","running"].includes(b.state)) - Number(["queued","running"].includes(a.state))).slice(0,6).map(job => {
+  $("jobList").innerHTML = [...jobs].reverse().sort((a,b) => Number(["pending","queued","running"].includes(b.state)) - Number(["pending","queued","running"].includes(a.state))).slice(0,6).map(job => {
     const progress = job.progress || {}, total = Number(progress.total) || 0, current = Number(progress.current) || 0;
     const percent = job.state === "completed" ? 100 : total ? Math.min(100,Math.max(0,current/total*100)) : job.state === "running" ? 3 : 0;
     const path = state.submittedJobs.get(job.id)?.path || job.path || job.source || "素材分析";
     const description = job.error || progress.message || jobNames[job.state] || job.state;
-    const canRetry = state.submittedJobs.has(job.id) || job.path;
-    return `<div class="job ${escapeHtml(job.state)}"><div class="job-heading"><strong title="${escapeHtml(path)}">${escapeHtml(shortName(path))}</strong>${["queued","running"].includes(job.state) ? `<button class="text-button" data-job-cancel="${escapeHtml(job.id)}">取消</button>` : ["failed","cancelled"].includes(job.state) && canRetry ? `<button class="text-button" data-job-retry="${escapeHtml(job.id)}">重试</button>` : `<small>${escapeHtml(jobNames[job.state] || job.state)}</small>`}</div><div class="job-progress"><span style="width:${percent}%"></span></div><small>${escapeHtml(description)}${total && job.state === "running" ? ` (${current}/${total})` : ""}</small>${job.asset_id ? `<button class="text-button" data-job-open="${escapeHtml(job.asset_id)}">查看记录 ↗</button>` : ""}</div>`;
+    return `<div class="job ${escapeHtml(job.state)}"><div class="job-heading"><strong title="${escapeHtml(path)}">${escapeHtml(shortName(path))}</strong>${["pending","queued","running"].includes(job.state) ? `<button class="text-button" data-job-cancel="${escapeHtml(job.id)}">取消</button>` : ["failed","cancelled"].includes(job.state) ? `<button class="text-button" data-job-retry="${escapeHtml(job.id)}">重试</button>` : `<small>${escapeHtml(jobNames[job.state] || job.state)}</small>`}</div><div class="job-progress"><span style="width:${percent}%"></span></div><small>${escapeHtml(description)}${total && job.state === "running" ? ` (${escapeHtml(formatProgress(progress))})` : ""}</small>${job.asset_id ? `<button class="text-button" data-job-open="${escapeHtml(job.asset_id)}">查看记录 ↗</button>` : ""}</div>`;
   }).join("");
 }
 async function pollJobs() {
   clearTimeout(pollTimer);
   try {
     const navigation = state.loadSequence;
-    const data = await api("/api/jobs"); const jobs = data.jobs || []; let changedAsset = null, shouldReload = false;
+    const data = await api("/api/jobs"); const jobs = data.jobs || []; state.queue = data.queue || {state:"idle"}; let changedAsset = null, shouldReload = false;
     for (const job of jobs) {
       const previous = state.jobStates.get(job.id);
       if (previous && previous !== job.state && ["completed","failed","cancelled"].includes(job.state)) {
@@ -415,46 +473,24 @@ $("jobList").addEventListener("click",async event => {
   const cancel = event.target.closest("[data-job-cancel]"), retry = event.target.closest("[data-job-retry]"), open = event.target.closest("[data-job-open]");
   try {
     if (cancel) { cancel.disabled = true; await api(`/api/jobs/${encodeURIComponent(cancel.dataset.jobCancel)}/cancel`,{method:"POST",body:"{}"}); await pollJobs(); }
-    if (retry) { const old = state.jobs.find(job => job.id === retry.dataset.jobRetry), request = state.submittedJobs.get(retry.dataset.jobRetry); if (!request) { openImport(old.path); return; } retry.disabled = true; const result = await api("/api/analyze",{method:"POST",body:JSON.stringify(request)}); state.submittedJobs.set(result.id,request); state.jobStates.set(result.id,"queued"); showToast("任务已重新加入队列"); await pollJobs(); }
-    if (open) await loadAsset(open.dataset.jobOpen);
+    if (retry) { retry.disabled = true; await api(`/api/jobs/${encodeURIComponent(retry.dataset.jobRetry)}/retry`,{method:"POST",body:"{}"}); showToast("任务已重新加入队列"); await pollJobs(); }
+    if (open) { window.framepulseQueue?.showReview(); await loadAsset(open.dataset.jobOpen); }
   } catch(error) { showToast(error.message,true); if (cancel) cancel.disabled = false; if (retry) retry.disabled = false; }
 });
-function openImport(path = "") {
-  $("sourcePath").value = path; $("importError").hidden = true;
-  $("providerUrl").value = state.config.provider_url || "http://127.0.0.1:11434/v1"; $("providerModel").value = state.config.model || "";
-  $("visionEnabled").checked = !!state.config.vision_available; $("providerOptions").hidden = !$("visionEnabled").checked;
-  $("importDialog").showModal(); $("sourcePath").focus();
-}
+function openImport(path = "") { window.framepulseQueue?.openImport(path); }
 $("importOpen").addEventListener("click",() => openImport()); $("emptyImport").addEventListener("click",() => openImport());
 $("reanalyzeButton").addEventListener("click",() => {
   if (!state.document) return; let path = state.document.asset.source?.uri || "";
   try { if (path.startsWith("file:")) { const url = new URL(path); path = decodeURIComponent(url.pathname); if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1); if (url.hostname) path = `//${url.hostname}${path}`; } } catch {}
   openImport(path);
 });
-$("visionEnabled").addEventListener("change",() => $("providerOptions").hidden = !$("visionEnabled").checked);
-$("browseButton").addEventListener("click",async () => {
-  $("browseButton").disabled = true; $("browseButton").textContent = "选择中…";
-  try { const data = await api("/api/pick",{method:"POST",body:"{}"}); if (data.path) $("sourcePath").value = data.path; }
-  catch(error) { $("importError").textContent = `文件选择器无法打开：${error.message} 也可以直接粘贴完整路径。`; $("importError").hidden = false; }
-  finally { $("browseButton").disabled = false; $("browseButton").textContent = "浏览…"; }
-});
-$("importForm").addEventListener("submit",async event => {
-  event.preventDefault(); $("importError").hidden = true;
-  const path = $("sourcePath").value.trim().replace(/^(["'])(.*)\1$/,"$2"); if (!path) return;
-  const vision = $("visionEnabled").checked, request = {path,vision,threshold:Number($("threshold").value) || 27};
-  if (vision) { request.provider_url = $("providerUrl").value.trim(); request.model = $("providerModel").value.trim(); if (!request.provider_url || !request.model) { $("importError").textContent = "请填写视觉模型服务地址与模型名称。"; $("importError").hidden = false; return; } }
-  $("startAnalysis").disabled = true; $("startAnalysis").textContent = "创建任务…";
-  try { const result = await api("/api/analyze",{method:"POST",body:JSON.stringify(request)}); state.submittedJobs.set(result.id,request); state.jobStates.set(result.id,"queued"); $("importDialog").close(); showToast(vision ? "开始拆镜与 AI 内容分析" : "开始本地拆镜与关键帧提取"); await pollJobs(); }
-  catch(error) { $("importError").textContent = error.message; $("importError").hidden = false; }
-  finally { $("startAnalysis").disabled = false; $("startAnalysis").innerHTML = '开始分析 <span>↗</span>'; }
-});
 document.querySelectorAll("[data-close]").forEach(button => button.addEventListener("click",() => $(button.dataset.close).close()));
 document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click",event => { if (event.target === dialog) { const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); } }));
 $("protocolOpen").addEventListener("click",async () => { $("protocolDialog").showModal(); try { const result = await api("/api/protocol"); $("protocolDetails").textContent = typeof result === "string" ? result : JSON.stringify(result,null,2); } catch(error) { $("protocolDetails").textContent = error.message; } });
-$("workspaceNav").addEventListener("click",() => { document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close()); $("main").scrollIntoView({block:"start"}); });
+$("workspaceNav").addEventListener("click",() => { window.framepulseQueue?.showReview(); document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close()); $("main").scrollIntoView({block:"start"}); });
 document.addEventListener("click",event => { if (!event.target.closest(".export-menu")) document.querySelectorAll(".export-menu[open]").forEach(menu => menu.open = false); });
 document.addEventListener("keydown",event => {
-  if (document.querySelector("dialog[open]") || event.target.closest("input,textarea,select,[contenteditable=true]") || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (!$("queuePanel").hidden || document.querySelector("dialog[open]") || event.target.closest("input,textarea,select,[contenteditable=true]") || event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.code === "Space" && state.document?.asset.kind === "video" && !event.target.closest("button,a,summary")) { event.preventDefault(); togglePlayback(); }
   if (event.key === "ArrowLeft") { event.preventDefault(); selectShot(state.shotIndex-1); }
   if (event.key === "ArrowRight") { event.preventDefault(); selectShot(state.shotIndex+1); }
@@ -463,7 +499,7 @@ document.addEventListener("keydown",event => {
 window.addEventListener("beforeunload",event => { if (state.dirty) { event.preventDefault(); event.returnValue = ""; } });
 async function boot() {
   const url = new URL(window.location.href), assetId = url.searchParams.get("asset"), shotId = url.searchParams.get("shot");
-  try { state.config = await api("/api/config"); state.token = state.config.token; await loadAssets({autoSelect:!assetId}); if (assetId) await loadAsset(assetId,{shotId}); }
+  try { state.config = await api("/api/config"); state.token = state.config.token; window.framepulseQueue?.configChanged(); await loadAssets({autoSelect:!assetId}); if (assetId) await loadAsset(assetId,{shotId}); }
   catch(error) { $("assetList").innerHTML = '<p class="library-empty">无法读取素材库<br>请确认本地服务已启动后刷新</p>'; showToast(error.message,true); }
   pollJobs();
 }

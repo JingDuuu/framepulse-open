@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json
 import math
 import queue
@@ -11,11 +12,13 @@ import ssl
 import threading
 import time
 from urllib.parse import urlsplit
+from PIL import Image
 
 from .media import AnalysisCancelled, check_cancel
 
-ANALYSIS_FIELDS = ("summary", "shot_size", "camera_angle", "composition", "camera_movement", "subjects", "actions", "setting", "lighting", "color", "narrative_function", "tags")
-LIST_FIELDS = {"subjects", "actions", "tags"}
+ANALYSIS_FIELDS = ("summary", "shot_size", "camera_angle", "composition", "camera_movement", "subjects", "actions", "setting", "lighting", "color", "narrative_function", "tags", "visual_medium", "themes")
+LIST_FIELDS = {"subjects", "actions", "tags", "themes"}
+VISUAL_MEDIA = {"2d_animation", "3d_animation", "live_action", "mixed", "screen_capture", "graphic", "unknown"}
 EMOTION_FIELDS = ("valence", "arousal", "tension")
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -24,11 +27,12 @@ SYSTEM_PROMPT = """你是专业影视导演的素材分析助手。只根据本�
 区分可见观察与导演解释；看不到/无法确定的值必须为 null。不得臆造镜头外事件、人物身份、品牌、台词、声音、音乐、精确焦距或作者意图。
 多个关键帧仅是时间抽样：可以谨慎描述可见人物动作；不能仅凭构图改变断言推拉摇移、焦距变化或复杂运镜；没有充分证据时 camera_movement 写 null。
 分析属性：summary 简洁中文视觉概述；shot_size 景别；camera_angle 机位角度；composition 主体位置/视线/前中后景/留白；camera_movement 运镜；subjects 可见主体数组；actions 可见动作数组；setting 可见环境；lighting 光位/软硬/明暗；color 色彩关系；narrative_function 可能的剪辑/叙事用途（明确写为推断）；tags 可检索视觉标签数组。
+visual_medium 只推断可见呈现媒介：2d_animation二维动画、3d_animation三维动画、live_action实拍、mixed混合、screen_capture屏幕录制、graphic图形设计；看不出技术来源写null，不能因写实风格就断言实拍。themes 为画面所支持的主题词数组，不推测作者意图或整片剧情。
 情绪是画面的主观导演解读而非人的真实心理；emotion 的 valence 0负向/0.5中性/1正向，arousal 0平静/1激烈，tension 0松弛/1紧张。无充分依据写 null，不能用亮度/节奏直接替代情绪。
 每个文字属性尽量控制在50个汉字以内，每个列表最多8项，每项简洁。直接给出属性值，不要用value/confidence/evidence_ids包裹每个属性。
 格式：{"analysis":{"summary":"简短描述或null","shot_size":"景别或null","camera_angle":"角度或null","composition":"构图或null","camera_movement":null,"subjects":["主体"],"actions":["动作"],"setting":"环境或null","lighting":"光线或null","color":"色彩或null","narrative_function":null,"tags":["标签"]},"emotion":{"valence":0.5,"arousal":0.3,"tension":0.2},"regions":[{"keyframe_id":"K1","xywh":[x,y,w,h],"label":"可见主体简短名称","confidence":null}]}。
 可选field_evidence对象可为某个字段指定最相关的1到2个短帧ID，如{"summary":["K1","K3"]}。不用返回置信度，没有可靠字段级依据就省略field_evidence。
-regions 可以为空。坐标相对于已显示/方向校正后的当前关键帧，左上原点，xywh 均为0到1且不能越界。严禁给未提供的帧添加区域。只输出 JSON，不要解释或 Markdown。"""
+请尽可能在给定region_anchor关键帧定位1到4个最显著可见人物/物体，每框一个明确主体，label用中文短名。regions确实无法定位时才为空；黑帧/透明图不猜测。坐标相对于已显示/方向校正后的当前关键帧，左上原点，xywh 均为0到1且不能越界。框仅描述对应静止关键帧，绝不表示持续跟踪。严禁给未提供的帧添加区域。只输出 JSON，不要解释或 Markdown。"""
 
 
 class ProviderError(RuntimeError):
@@ -39,6 +43,8 @@ def _output_schema(evidence_ids):
     fields = {}
     for name in ANALYSIS_FIELDS:
         value_type = {"type": ["array", "null"], "items": {"type": "string"}, "maxItems": 8} if name in LIST_FIELDS else {"type": ["string", "null"], "maxLength": 200}
+        if name == "visual_medium":
+            value_type = {"enum": sorted(VISUAL_MEDIA) + [None]}
         fields[name] = value_type
     return {"type": "object", "properties": {
         "analysis": {"type": "object", "properties": fields, "required": list(ANALYSIS_FIELDS), "additionalProperties": False},
@@ -200,6 +206,11 @@ def normalize_result(raw, evidence_ids):
                 value = value or None
             else:
                 value = None
+        elif field == "visual_medium":
+            if not isinstance(value, str) or value not in VISUAL_MEDIA:
+                if value is not None:
+                    warnings.append("模型媒介分类不在受支持词表内，已置为未知")
+                value = None
         elif isinstance(value, str):
             value = value.strip()[:3000] or None
             if value and value.lower() in {"unknown", "null", "n/a", "不确定", "未知", "无法判断"}:
@@ -235,7 +246,8 @@ def normalize_result(raw, evidence_ids):
         if not isinstance(label, str) or not label.strip():
             continue
         result["regions"].append({"keyframe_id": region["keyframe_id"], "xywh": [float(value) for value in box],
-                                  "label": label.strip()[:160], "confidence": _confidence(region.get("confidence")), "origin": "inferred"})
+                                  "label": label.strip()[:160], "confidence": _confidence(region.get("confidence")), "origin": "inferred",
+                                  "extensions": {"source": "vision", "tracking": False}})
     if not any(item["value"] is not None for item in result["analysis"].values()):
         def explicit_unknown(item):
             value = item.get("value") if isinstance(item, dict) and "value" in item else item
@@ -251,27 +263,36 @@ def normalize_result(raw, evidence_ids):
     return result
 
 
-def analyze_shot(shot, bundle, provider_url, model, api_key=None, *, cancel=None, timeout=180):
+def analyze_shot(shot, bundle, provider_url, model, api_key=None, *, cancel=None, timeout=180, max_frames=5, image_max_side=960, context_limit=8192):
+    started = time.monotonic()
     parsed, path, native = provider_endpoint(provider_url)
     if not isinstance(model, str) or not model.strip():
         raise ValueError("启用 AI 需要配置视觉模型名称 model")
-    evidence = shot["keyframes"][:5]
+    evidence = shot["keyframes"][:max_frames]
     # UUID repetition can consume thousands of tokens and truncate otherwise
     # valid responses. Short IDs are request-local; records retain stable UUIDs.
     evidence_map = {f"K{index + 1}": frame["id"] for index, frame in enumerate(evidence)}
     frames_description = [{"id": f"K{index + 1}", "time_us": frame.get("time_us")} for index, frame in enumerate(evidence)]
     user_text = json.dumps({"task": "分析此素材单元的视觉内容；按提供的关键帧顺序理解变化。", "shot_range": shot.get("range"), "keyframes": frames_description,
-                            "display_notes": shot.get("extensions", {}).get("display_notes", [])}, ensure_ascii=False)
+                            "region_anchor": f"K{len(evidence) // 2 + 1}", "display_notes": shot.get("extensions", {}).get("display_notes", [])}, ensure_ascii=False)
     images = []
     for frame in evidence:
         check_cancel(cancel)
         path_to_frame = (bundle / frame["uri"]).resolve()
         if not path_to_frame.is_relative_to(bundle.resolve()) or path_to_frame.stat().st_size > 8 * 1024 * 1024:
             raise ValueError("关键帧路径或大小不合法")
-        images.append(base64.b64encode(path_to_frame.read_bytes()).decode("ascii"))
+        with Image.open(path_to_frame) as opened:
+            if max(opened.size) > image_max_side:
+                opened.thumbnail((image_max_side, image_max_side), Image.Resampling.LANCZOS)
+                buffer = io.BytesIO()
+                opened.convert("RGB").save(buffer, format="JPEG", quality=88)
+                data = buffer.getvalue()
+            else:
+                data = path_to_frame.read_bytes()
+        images.append(base64.b64encode(data).decode("ascii"))
     if native:
         payload = {"model": model, "stream": False, "think": False, "format": _output_schema(list(evidence_map)),
-                   "options": {"temperature": 0.15, "num_predict": 3000, "num_ctx": 8192},
+                   "options": {"temperature": 0.15, "num_predict": 3000, "num_ctx": context_limit},
                    "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_text, "images": images}]}
     else:
         content = [{"type": "text", "text": user_text}]
@@ -280,6 +301,8 @@ def analyze_shot(shot, bundle, provider_url, model, api_key=None, *, cancel=None
         payload = {"model": model, "stream": False, "temperature": 0.15, "max_tokens": 3000,
                    "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}]}
     host = parsed.netloc
+    preparation_ms = round((time.monotonic() - started) * 1000, 2)
+    inference_started = time.monotonic()
     retried = False
     for attempt in range(2):
         check_cancel(cancel)
@@ -314,7 +337,22 @@ def analyze_shot(shot, bundle, provider_url, model, api_key=None, *, cancel=None
         normalized["warnings"].append("模型首次输出无效，已重新请求并通过字段校验；未补猜原始结果。")
     normalized["provider"] = "ollama" if native else "openai-compatible"
     normalized["response_model"] = str(response.get("model") or model)[:180]
-    normalized["usage"] = {"input_tokens": response.get("prompt_eval_count") if native else response.get("usage", {}).get("prompt_tokens"),
-                           "output_tokens": response.get("eval_count") if native else response.get("usage", {}).get("completion_tokens"),
-                           "finish_reason": finish_reason, "context_limit": 8192 if native else None, "retry_count": int(retried)}
+    reported_usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    def count_or_unknown(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    normalized["usage"] = {"input_tokens": count_or_unknown(response.get("prompt_eval_count") if native else reported_usage.get("prompt_tokens")),
+                           "output_tokens": count_or_unknown(response.get("eval_count") if native else reported_usage.get("completion_tokens")),
+                           "finish_reason": finish_reason, "context_limit": context_limit if native else None, "retry_count": int(retried),
+                           "submitted_frames": len(evidence), "image_max_side": image_max_side}
+    normalized["usage"].update(preparation_ms=preparation_ms, request_wall_ms=round((time.monotonic() - inference_started) * 1000, 2))
+    if native:
+        for source, target in (("total_duration", "server_total_ms"), ("load_duration", "model_load_ms"), ("prompt_eval_duration", "prompt_eval_ms"), ("eval_duration", "generation_ms")):
+            value = response.get(source)
+            normalized["usage"][target] = round(value / 1_000_000, 2) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
+        for source, target in (("total_duration", "total_seconds"), ("load_duration", "load_seconds"), ("prompt_eval_duration", "prompt_eval_seconds"), ("eval_duration", "eval_seconds")):
+            value = response.get(source)
+            normalized["usage"][target] = round(value / 1_000_000_000, 6) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
+        duration, tokens = response.get("eval_duration"), response.get("eval_count")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) and duration > 0 and isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+            normalized["usage"]["generation_tokens_per_second"] = round(tokens * 1_000_000_000 / duration, 2)
     return normalized

@@ -4,6 +4,7 @@ import json
 import pytest
 
 from framepulse.protocol import export_shots_csv, export_web_annotations, read_document, validate_document, write_document
+from framepulse.protocol import append_shot_checkpoint, build_overview, claim, compact_document
 
 
 def test_valid_and_bad_evidence_are_distinguished(document):
@@ -83,3 +84,110 @@ def test_identity_and_image_time_are_checked(document):
     errors = validate_document(document)
     assert any("image duration" in e for e in errors)
     assert any("image time" in e for e in errors)
+
+
+def two_shots(document):
+    first = document["shots"][0]
+    first["range"]["end_us"] = 1_000_000
+    first["keyframes"][0]["time_us"] = 500_000
+    second = copy.deepcopy(first)
+    second.update(id="shot-2", index=2)
+    second["range"] = {"start_us": 1_000_000, "end_us": 2_000_000}
+    second["keyframes"][0].update(id="frame-2", time_us=1_500_000)
+    for group in ("analysis", "emotion"):
+        for item in second[group].values():
+            item["evidence_ids"] = ["frame-2"]
+    document["shots"].append(second)
+    return first, second
+
+
+def test_overview_aggregates_mixed_media_and_cites_real_sources(document):
+    first, second = two_shots(document)
+    first["analysis"]["visual_medium"] = claim("2d_animation", "inferred", evidence_ids=["frame-1"], run_id="run-1")
+    first["analysis"]["themes"] = claim(["友情"], "inferred", evidence_ids=["frame-1"])
+    second["analysis"]["summary"] = claim("真实街头的人群", "inferred", evidence_ids=["frame-2"])
+    second["analysis"]["visual_medium"] = claim("live_action", "inferred", evidence_ids=["frame-2"])
+    second["analysis"]["themes"] = claim(["城市"], "inferred", evidence_ids=["frame-2"])
+    document["overview"] = build_overview(document)
+    overview = document["overview"]
+    assert overview["analysis"]["visual_medium"]["value"] == ["2d_animation", "live_action"]
+    assert overview["analysis"]["themes"]["value"] == ["友情", "城市"]
+    assert overview["coverage"]["semantic_shots"] == 2
+    assert overview["analysis"]["summary"]["source_shot_ids"] == ["shot-1", "shot-2"]
+    assert set(overview["analysis"]["summary"]["evidence_ids"]) == {"frame-1", "frame-2"}
+    assert not validate_document(document)
+    overview["analysis"]["summary"]["evidence_ids"] = ["imaginary"]
+    assert any("overview/summary: unresolved evidence" in error for error in validate_document(document))
+
+
+def test_incomplete_overview_does_not_invent_a_whole_film_story(document):
+    first, second = two_shots(document)
+    second["status"] = "measured"
+    second["analysis"] = {"summary": claim(None, "inferred"), "brightness": claim(0.4)}
+    overview = build_overview(document)
+    assert overview["status"] == "partial"
+    assert overview["coverage"]["semantic_shots"] == 1
+    assert "1/2" in overview["analysis"]["summary"]["value"]
+    assert overview["analysis"]["narrative"]["value"] is None
+    assert overview["analysis"]["visual_medium"]["value"] is None
+    assert overview["source_shot_ids"] == ["shot-1"]
+
+
+def test_overview_respects_human_and_rejected_claims(document):
+    human = claim("导演自己的整体判断", "human", evidence_ids=["frame-1"])
+    human["review_status"] = "edited"
+    document["overview"] = {"analysis": {"summary": human}}
+    overview = build_overview(document)
+    assert overview["analysis"]["summary"] == human
+    document["shots"][0]["analysis"]["summary"]["review_status"] = "rejected"
+    overview = build_overview(document)
+    assert overview["coverage"]["semantic_shots"] == 0
+
+
+def test_journal_replays_crash_tail_then_compacts_standalone(tmp_path, document):
+    path = tmp_path / "record.fmp.json"
+    write_document(path, document)
+    document["shots"][0]["analysis"]["summary"]["value"] = "durable checkpoint"
+    append_shot_checkpoint(path, document, document["shots"][0], [{"action": "test", "number": 1}])
+    journal = path.with_name("record.fmp.journal.jsonl")
+    with journal.open("ab") as handle:
+        handle.write(b'{"unfinished":')
+    recovered = read_document(path)
+    assert recovered["shots"][0]["analysis"]["summary"]["value"] == "durable checkpoint"
+    assert len(recovered["history"]) == 1
+    recovered["shots"][0]["analysis"]["summary"]["value"] = "next durable checkpoint"
+    append_shot_checkpoint(path, recovered, recovered["shots"][0])
+    recovered = read_document(path)
+    assert len(recovered["history"]) == 1
+    assert recovered["shots"][0]["analysis"]["summary"]["value"] == "next durable checkpoint"
+    assert not validate_document(recovered)
+    compact_document(path, recovered)
+    assert not journal.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["shots"][0]["analysis"]["summary"]["value"] == "next durable checkpoint"
+
+
+def test_old_journal_cannot_override_later_human_revision(tmp_path, document):
+    path = tmp_path / "record.fmp.json"
+    write_document(path, document)
+    document["shots"][0]["analysis"]["summary"]["value"] = "AI checkpoint"
+    append_shot_checkpoint(path, document, document["shots"][0])
+    human = read_document(path)
+    human["revision"] += 1
+    human["shots"][0]["analysis"]["summary"] = claim("human correction", "human")
+    human["overview"] = build_overview(human)
+    write_document(path, human)  # Leave the earlier journal to exercise revision guard.
+    assert read_document(path)["shots"][0]["analysis"]["summary"]["value"] == "human correction"
+
+
+def test_journal_mismatched_document_and_revision_gap_are_rejected(tmp_path, document):
+    path = tmp_path / "record.fmp.json"
+    write_document(path, document)
+    event = {"format": "framepulse.checkpoint", "document_id": "other", "revision": 2}
+    journal = path.with_name("record.fmp.journal.jsonl")
+    journal.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="不匹配"):
+        read_document(path)
+    event.update(document_id=document["id"], revision=3)
+    journal.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="连续修订"):
+        read_document(path)

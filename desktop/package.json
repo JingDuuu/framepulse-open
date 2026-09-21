@@ -1,0 +1,51 @@
+{
+  "name": "framepulse-desktop",
+  "version": "0.2.0",
+  "private": true,
+  "description": "FramePulse — local media annotation and director review",
+  "author": "FramePulse contributors",
+  "license": "MIT",
+  "engines": { "node": ">=22.12.0" },
+  "main": "main.cjs",
+  "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
+    "start": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "dist": "electron-builder --win nsis zip --x64",
+    "pack": "electron-builder --win --dir --x64"
+  },
+  "devDependencies": {
+    "electron": "44.4.3",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "org.framepulse.desktop",
+    "productName": "FramePulse",
+    "artifactName": "FramePulse-${version}-${os}-${arch}.${ext}",
+    "directories": { "output": "../dist", "buildResources": "assets" },
+    "files": ["main.cjs", "preload.cjs", "lifecycle.cjs", "assets/icon.png", "package.json"],
+    "extraFiles": [{ "from": "framepulse.cmd", "to": "framepulse.cmd" }],
+    "extraResources": [
+      { "from": "../build/backend/framepulse-backend", "to": "backend", "filter": ["**/*"] },
+      { "from": "../build/desktop-licenses", "to": "third-party-notices", "filter": ["**/*"] }
+    ],
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "npmRebuild": false,
+    "win": {
+      "icon": "assets/icon.ico",
+      "executableName": "FramePulse",
+      "target": [{ "target": "nsis", "arch": ["x64"] }, { "target": "zip", "arch": ["x64"] }]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FramePulse",
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "FramePulse-Setup-${version}-x64.exe"
+    }
+  }
+}

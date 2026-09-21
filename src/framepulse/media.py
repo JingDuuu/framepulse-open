@@ -26,6 +26,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 MAX_PIXELS = 80_000_000
+MAX_VIDEO_DURATION_US = 45 * 60 * 1_000_000
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".heic", ".heif"}
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 
@@ -140,6 +141,8 @@ def probe_video(source, cancel=None):
             width, height = height, width
         duration = video.get("duration") or data.get("format", {}).get("duration")
         result = {"width": width, "height": height, "duration_us": round(float(duration) * 1_000_000) if duration else None,
+                  "reported_start_time_us": round(float(video.get("start_time") or 0) * 1_000_000),
+                  "duration_is_stream_relative": bool(video.get("duration")),
                   "frame_rate": _rate_dict(video.get("avg_frame_rate")), "codec": video.get("codec_name"),
                   "has_audio": any(item.get("codec_type") == "audio" for item in data.get("streams", [])),
                   "time_base": video.get("time_base"), "rotation_degrees": rotation,
@@ -162,14 +165,28 @@ def probe_video(source, cancel=None):
             capture.release()
         duration = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", log)
         codec = re.search(r"Stream[^\n]*Video:\s*([^\s,(]+)", log)
+        start = re.search(r"\bstart:\s*(-?[\d.]+)", log)
         result = {"width": width, "height": height,
                   "duration_us": round((int(duration[1]) * 3600 + int(duration[2]) * 60 + float(duration[3])) * 1_000_000) if duration else None,
                   "frame_rate": _rate_dict(Fraction(fps).limit_denominator(100_000)) if fps and math.isfinite(fps) else None,
                   "codec": codec[1] if codec else None, "has_audio": bool(re.search(r"Stream[^\n]*Audio:", log)),
-                  "time_base": None, "rotation_degrees": orientation, "probe_method": "ffmpeg-log+opencv"}
+                  "time_base": None, "rotation_degrees": orientation, "probe_method": "ffmpeg-log+opencv",
+                  "reported_start_time_us": round(float(start[1]) * 1_000_000) if start else 0, "duration_is_stream_relative": False}
     if result["width"] <= 0 or result["height"] <= 0 or result["width"] * result["height"] > MAX_PIXELS:
         raise ValueError(f"素材尺寸异常或超过 {MAX_PIXELS:,} 像素上限")
     return result
+
+
+def enforce_duration_limit(technical, *, decoded=False):
+    duration = technical.get("duration_us")
+    if duration is None:
+        return
+    # Container end times may include a positive presentation offset. The final
+    # decoded duration is always authoritative and normalized to the first PTS.
+    if not decoded and not technical.get("duration_is_stream_relative"):
+        duration -= max(0, technical.get("reported_start_time_us", 0))
+    if duration > MAX_VIDEO_DURATION_US:
+        raise ValueError("当前单个视频上限为 45 分钟（2700 秒）；请先按章节分段后分析。")
 
 
 def frame_metrics(bgr):
@@ -194,9 +211,9 @@ def dominant_colors(bgr, count=5):
     return [{"hex": "#" + "".join(f"{int(c):02x}" for c in colors[i]), "share": round(int(counts[i]) / 4096, 4)} for i in order]
 
 
-def scan_video(source, technical, threshold, cancel=None, progress=None):
+def scan_video(source, technical, threshold, cancel=None, progress=None, *, max_side=320):
     """Return every frame's PTS, low-resolution measurements, and hard cuts."""
-    scale = min(1, 320 / max(technical["width"], technical["height"]))
+    scale = min(1, max_side / max(technical["width"], technical["height"]))
     width = max(2, round(technical["width"] * scale / 2) * 2)
     height = max(2, round(technical["height"] * scale / 2) * 2)
     args = [ffmpeg_executable(), "-hide_banner", "-nostdin", "-copyts", "-i", str(source),
@@ -282,6 +299,8 @@ def scan_video(source, technical, threshold, cancel=None, progress=None):
             if first_pts_us is None:
                 first_pts_us = pts_us
             at_us = pts_us - first_pts_us
+            if at_us >= MAX_VIDEO_DURATION_US:
+                raise ValueError("实际解码时长超过 45 分钟上限，已停止并保留原文件。")
             if frames and at_us <= frames[-1]["time_us"]:
                 raise ValueError("素材存在重复或倒退的呈现时间戳；请先无损重封装后重试")
             bgr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
@@ -326,6 +345,7 @@ def scan_video(source, technical, threshold, cancel=None, progress=None):
                       "timing_accuracy": "decoded_pts_rounded_to_microseconds", "timing_frame_exact": False,
                       "last_frame_duration_estimated": not bool(frames[-1]["duration_us"]),
                       "frame_rate_mode": "variable" if intervals and max(intervals) - min(intervals) > 4 else "constant"})
+    enforce_duration_limit(technical, decoded=True)
     # Camera/object movement can make pixel differences large on every frame.
     # Keep isolated changes and strong distribution changes, suppress sustained
     # high-motion differences with similar color distribution. This remains a
@@ -363,18 +383,42 @@ def select_keyframes(frames, start, end, count=5):
     return sorted(selected)
 
 
-def extract_keyframes(source, bundle, indices, technical, cancel=None, progress=None):
+def _selection_expression(indices):
+    """Balanced lazy if expression: O(log selections), not K eq tests/frame."""
+    values = sorted(set(indices))
+    if not values:
+        return "0"
+    ranges = []
+    for value in values:
+        if ranges and value == ranges[-1][1] + 1:
+            ranges[-1][1] = value
+        else:
+            ranges.append([value, value])
+    def branch(left, right):
+        if right - left == 1:
+            first, last = ranges[left]
+            return f"eq(n,{first})" if first == last else f"between(n,{first},{last})"
+        middle = (left + right) // 2
+        return f"if(lt(n,{ranges[middle][0]}),{branch(left, middle)},{branch(middle, right)})"
+    return branch(0, len(ranges))
+
+
+def extract_keyframes(source, bundle, indices, technical, cancel=None, progress=None, *, max_side=1280):
     frame_dir = bundle / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
-    scale = min(1, 1280 / max(technical["width"], technical["height"]))
+    scale = min(1, max_side / max(technical["width"], technical["height"]))
     width, height = max(2, round(technical["width"] * scale / 2) * 2), max(2, round(technical["height"] * scale / 2) * 2)
     ordered = sorted(set(indices))
     # A filter script avoids Windows' command-line length limit for long films.
     with tempfile.TemporaryDirectory(prefix="extract-", dir=bundle) as temp:
         temp = Path(temp)
         script = temp / "filter.txt"
-        script.write_text("select='" + "+".join(f"eq(n,{i})" for i in ordered) + f"',scale={width}:{height}:flags=lanczos", encoding="utf-8")
+        script.write_text("select='" + _selection_expression(ordered) + f"',scale={width}:{height}:flags=lanczos", encoding="utf-8")
+        last_tick = [0.0]
         def tick():
+            if time.monotonic() - last_tick[0] < 0.8:
+                return
+            last_tick[0] = time.monotonic()
             done = len(list(temp.glob("frame-*.jpg")))
             emit(progress, "keyframes", done, len(ordered), f"提取多帧证据 · {done}/{len(ordered)}")
         run_process([ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(source), "-map", "0:v:0",
@@ -391,7 +435,7 @@ def extract_keyframes(source, bundle, indices, technical, cancel=None, progress=
     return result
 
 
-def prepare_image(source, bundle, cancel=None):
+def prepare_image(source, bundle, cancel=None, *, max_side=1280):
     check_cancel(cancel)
     with Image.open(source) as original:
         if original.width * original.height > MAX_PIXELS:
@@ -413,7 +457,7 @@ def prepare_image(source, bundle, cancel=None):
                      "display_orientation_applied": True, "embedded_frame_count": frames, "probe_method": "pillow", "has_alpha": has_alpha}
         if has_alpha:
             technical.update(alpha_preview_background="#808080", visible_pixel_fraction=visible_fraction)
-        display.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+        display.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
         frame_dir = bundle / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
         destination = frame_dir / "image.jpg"

@@ -205,3 +205,89 @@ def test_changed_model_reanalyzes_and_archives_old_ai(tmp_path, monkeypatch):
     archived = next(item for item in changed["history"] if item["action"] == "vision-reanalysis")
     assert archived["before"]["analysis"]["summary"]["value"] == "description by first"
     assert validate_document(changed) == []
+
+
+@pytest.mark.parametrize("profile,count", [("fast", 3), ("balanced", 5), ("detailed", 7)])
+def test_profiles_keep_full_pts_scan_with_different_evidence_density(three_shots, tmp_path, profile, count):
+    doc = read_document(engine.analyze_asset(three_shots, tmp_path / profile, profile=profile))
+    assert doc["asset"]["technical"]["decoded_frames"] == 36
+    assert doc["asset"]["technical"]["duration_us"] == 1_500_000
+    assert all(len(shot["keyframes"]) == count for shot in doc["shots"])
+    assert doc["extensions"]["profile"] == profile
+    assert doc["overview"]["status"] == "measured"
+    assert doc["overview"]["analysis"]["summary"]["value"] is None
+
+
+def test_overlong_metadata_is_rejected_before_reading_entire_file(three_shots, tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "probe_video", lambda *args: {"duration_us": media.MAX_VIDEO_DURATION_US + 1, "duration_is_stream_relative": True})
+    def forbidden(*args):
+        raise AssertionError("hash should not run for known overlong video")
+    monkeypatch.setattr(media, "sha256_file", forbidden)
+    with pytest.raises(ValueError, match="45"):
+        engine.analyze_asset(three_shots, tmp_path / "library")
+
+
+def test_duration_cap_handles_source_pts_offset_without_false_rejection():
+    media.enforce_duration_limit({"duration_us": media.MAX_VIDEO_DURATION_US + 2_000_000, "reported_start_time_us": 2_000_000})
+    media.enforce_duration_limit({"duration_us": media.MAX_VIDEO_DURATION_US}, decoded=True)
+    with pytest.raises(ValueError, match="45"):
+        media.enforce_duration_limit({"duration_us": media.MAX_VIDEO_DURATION_US + 1}, decoded=True)
+
+
+def test_scan_enforces_duration_even_when_container_metadata_lies(three_shots, monkeypatch):
+    technical = media.probe_video(three_shots)
+    technical["duration_us"] = 100_000
+    monkeypatch.setattr(media, "MAX_VIDEO_DURATION_US", 500_000)
+    with pytest.raises(ValueError, match="45"):
+        media.scan_video(three_shots, technical, 27)
+
+
+def test_measurement_plan_survives_cancelled_extraction(three_shots, tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    original_extract = media.extract_keyframes
+    monkeypatch.setattr(media, "extract_keyframes", lambda *args, **kwargs: (_ for _ in ()).throw(media.AnalysisCancelled("cancel extraction")))
+    with pytest.raises(media.AnalysisCancelled):
+        engine.analyze_asset(three_shots, library)
+    assert next(library.glob("*/.measurement-cache.json")).is_file()
+    monkeypatch.setattr(media, "extract_keyframes", original_extract)
+    monkeypatch.setattr(media, "scan_video", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must resume scan plan, not decode again")))
+    record = engine.analyze_asset(three_shots, library)
+    assert len(read_document(record)["shots"]) == 3
+    assert not list(library.glob("*/.measurement-cache.json"))
+
+
+def test_midrun_reader_sees_journal_and_controlled_cancel_compacts(three_shots, tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    observed = []
+    def fake(shot, *args, **kwargs):
+        if shot["index"] == 2:
+            record = next(library.glob("*/record.fmp.json"))
+            observed.append(read_document(record)["shots"][0]["status"])
+            assert record.with_name("record.fmp.journal.jsonl").is_file()
+            raise media.AnalysisCancelled("stop after durable first shot")
+        return result_for(shot)
+    monkeypatch.setattr(providers, "analyze_shot", fake)
+    with pytest.raises(media.AnalysisCancelled):
+        engine.analyze_asset(three_shots, library, vision=True, provider_url="http://localhost:9000/v1", model="fixture")
+    record = next(library.glob("*/record.fmp.json"))
+    assert observed == ["analyzed"]
+    assert not record.with_name("record.fmp.journal.jsonl").exists()
+    assert read_document(record)["runs"][-1]["status"] == "cancelled"
+
+
+def test_balanced_frame_selector_extracts_actual_requested_frames(three_shots, tmp_path):
+    technical = media.probe_video(three_shots)
+    indices = [0, 1, 5, 11, 12, 19, 23, 24, 33, 35]
+    result = media.extract_keyframes(three_shots, tmp_path, indices, technical)
+    assert sorted(result) == indices
+    for index, frame in result.items():
+        pixels = cv2.imdecode(np.fromfile(tmp_path / frame["uri"], dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert np.argmax(np.mean(pixels, axis=(0, 1))) == [2, 0, 1][index // 12]
+    # A large arbitrary selection remains logarithmic in branch depth.
+    expr = media._selection_expression(range(0, 100_000, 17))
+    depth = maximum = 0
+    for character in expr:
+        depth += character == "("
+        depth -= character == ")"
+        maximum = max(maximum, depth)
+    assert maximum < 20
