@@ -1,0 +1,15 @@
+.reference/
+.venv/
+.qa-venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+runtime/
+qa-output/
+.env
+*.local.json
+node_modules/

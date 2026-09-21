@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:framepulse:media-schema:0.1.0",
+  "title": "FramePulse Media Protocol 0.1.0 (experimental)",
+  "type": "object",
+  "required": ["format", "spec_version", "id", "revision", "created_at", "updated_at", "asset", "time", "shots", "runs", "history", "warnings", "extensions"],
+  "properties": {
+    "format": {"const": "framepulse.media"},
+    "spec_version": {"const": "0.1.0"},
+    "id": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "asset": {
+      "type": "object", "required": ["id", "kind", "name", "source", "technical"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["video", "image"]},
+        "name": {"type": "string"},
+        "source": {"type": "object", "required": ["uri", "sha256", "size_bytes"], "properties": {
+          "uri": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "size_bytes": {"type": "integer", "minimum": 1}
+        }},
+        "technical": {"type": "object", "required": ["width", "height", "duration_us"], "properties": {
+          "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1},
+          "duration_us": {"type": ["integer", "null"], "minimum": 1},
+          "frame_rate": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["numerator", "denominator"], "properties": {
+            "numerator": {"type": "integer", "minimum": 1}, "denominator": {"type": "integer", "minimum": 1}
+          }}]}
+        }}
+      }
+    },
+    "time": {"type": "object", "required": ["unit", "origin", "interval"], "properties": {
+      "unit": {"const": "microseconds"}, "origin": {"const": "first_presented_frame"}, "interval": {"const": "half-open"}
+    }},
+    "shots": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/shot"}},
+    "runs": {"type": "array", "items": {"type": "object", "required": ["id", "kind", "provider", "started_at", "status"], "properties": {
+      "id": {"type": "string"}, "kind": {"type": "string"}, "provider": {"type": "string"},
+      "model": {"type": ["string", "null"]}, "started_at": {"type": "string"},
+      "completed_at": {"type": ["string", "null"]}, "status": {"type": "string"}, "config": {"type": "object"}
+    }}},
+    "history": {"type": "array"}, "warnings": {"type": "array"}, "extensions": {"type": "object"}
+  },
+  "$defs": {
+    "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "claim": {"type": "object", "required": ["value", "origin", "confidence", "evidence_ids", "run_id", "review_status"], "properties": {
+      "value": {}, "origin": {"enum": ["measured", "inferred", "human"]}, "confidence": {"$ref": "#/$defs/confidence"},
+      "evidence_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+      "run_id": {"type": ["string", "null"]}, "review_status": {"enum": ["unreviewed", "accepted", "edited", "rejected"]}
+    }},
+    "region": {"type": "object", "required": ["id", "keyframe_id", "xywh", "label", "origin", "confidence"], "properties": {
+      "id": {"type": "string"}, "keyframe_id": {"type": "string"}, "label": {"type": "string", "maxLength": 1000},
+      "origin": {"enum": ["human", "inferred"]}, "confidence": {"$ref": "#/$defs/confidence"},
+      "xywh": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number", "minimum": 0, "maximum": 1}}
+    }},
+    "shot": {"type": "object", "required": ["id", "index", "range", "boundary", "keyframes", "analysis", "emotion", "regions", "review", "status", "warnings"], "properties": {
+      "id": {"type": "string", "minLength": 1}, "index": {"type": "integer", "minimum": 1},
+      "range": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["start_us", "end_us"], "properties": {
+        "start_us": {"type": "integer", "minimum": 0}, "end_us": {"type": "integer", "minimum": 1}
+      }}]},
+      "boundary": {"type": "object", "required": ["method", "confidence"], "properties": {
+        "method": {"type": "string"}, "confidence": {"$ref": "#/$defs/confidence"}
+      }},
+      "keyframes": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "time_us", "uri", "width", "height"], "properties": {
+        "id": {"type": "string"}, "time_us": {"type": ["integer", "null"], "minimum": 0}, "uri": {"type": "string"},
+        "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}
+      }}},
+      "analysis": {"type": "object", "additionalProperties": {"$ref": "#/$defs/claim"}},
+      "emotion": {"type": "object", "additionalProperties": {"$ref": "#/$defs/claim"}},
+      "regions": {"type": "array", "items": {"$ref": "#/$defs/region"}},
+      "review": {"type": "object", "required": ["state", "note"], "properties": {
+        "state": {"enum": ["unreviewed", "accepted", "edited", "rejected"]}, "note": {"type": "string"}
+      }},
+      "status": {"enum": ["measured", "analyzed", "failed"]}, "warnings": {"type": "array"}
+    }}
+  }
+}
