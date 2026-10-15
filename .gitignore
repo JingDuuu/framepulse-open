@@ -13,3 +13,12 @@ qa-output/
 .env
 *.local.json
 node_modules/
+# Model weights and local model caches are never distributed with this project.
+.ollama/
+models/
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt

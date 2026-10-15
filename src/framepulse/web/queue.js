@@ -3,6 +3,7 @@
 (() => {
   let queueBusy = false, importBusy = false, models = [], localProviderUrl = "http://127.0.0.1:11434/v1", dragDepth = 0;
   let view = "review";
+  let connectionTimer, connecting = false;
   const phaseNames = {queued:"等待处理",pending:"等待处理",hash:"识别素材",hashing:"识别素材",probe:"读取媒体信息",probing:"读取媒体信息",measure:"读取图片",measurement:"测量与拆镜",detect:"逐帧检测",decode:"逐帧测量",decoding:"逐帧测量",detection:"检测镜头边界",resume:"恢复检查点",keyframes:"提取证据关键帧",frames:"提取证据关键帧",preview:"制作播放预览",vision:"AI 镜头分析",ocr:"文字识别",overview:"整片概括",complete:"完成",completed:"完成",finalize:"写入记录"};
   const profiles = () => state.config.profiles || {balanced:{name:"均衡",description:"完整镜头测量与适量证据帧"}};
   const profileName = key => profiles()[key]?.name || profiles()[key]?.label || key || "均衡";
@@ -108,15 +109,39 @@
     $("providerOptions").hidden = false;
     ["providerUrl","providerModel","providerKey","clearProviderKey"].forEach(id => $(id).disabled = local);
   }
+  async function connectOllama(automatic = false) {
+    if (connecting || (automatic && !state.config.auto_connect)) return;
+    connecting = true; $("connectOllama").disabled = true;
+    try {
+      const result = await api("/api/ollama/connect",{method:"POST",body:JSON.stringify({automatic})});
+      state.config = {...state.config,...result.config}; configChanged();
+      if (result.connected) {
+        $("visionEnabled").checked = true; $("providerMode").value = "local";
+        $("localModel").value = state.config.model;
+        if ($("settingsDialog").open) { syncProviderFields(); await refreshModels(); }
+        showToast(`已连接本地模型 ${state.config.model}，用于之后加入的任务`);
+      } else if (!automatic) {
+        await refreshModels();
+        $("ollamaHelp").open = true;
+      }
+    } catch(error) { if (!automatic) { $("modelStatus").textContent = error.message; $("ollamaHelp").open = true; } }
+    finally {
+      connecting = false; $("connectOllama").disabled = false;
+      clearTimeout(connectionTimer);
+      if (state.config.auto_connect) connectionTimer = setTimeout(() => connectOllama(true), 20000);
+    }
+  }
   async function refreshModels() {
     $("refreshModels").disabled = true; $("modelStatus").textContent = "正在读取本地模型列表…";
     try {
       const result = await api(`/api/models?provider_url=${encodeURIComponent(localProviderUrl)}`); models = result.models || []; localProviderUrl = result.provider_url || localProviderUrl;
       const previous = $("localModel").value || state.config.model;
-      $("localModel").innerHTML = '<option value="">选择视觉模型</option>' + models.map(model => `<option value="${escapeHtml(model.name)}"${model.vision ? "" : " disabled"}>${escapeHtml(model.name)}${model.vision ? "" : "（非视觉模型）"}</option>`).join("");
-      $("localModel").value = models.some(model => model.name === previous && model.vision) ? previous : models.find(model => model.vision)?.name || "";
-      const count = models.filter(model => model.vision).length;
-      $("modelStatus").textContent = result.errors?.length ? result.errors.map(item => typeof item === "string" ? item : JSON.stringify(item)).join("；") : count ? `${count} 个可用视觉模型。程序不会自动下载模型。` : "未发现可用视觉模型。请启动 Ollama 并准备视觉模型，或选择兼容服务。";
+      const usable = model => model.vision === true && !model.remote;
+      $("localModel").innerHTML = '<option value="">选择视觉模型</option>' + models.map(model => `<option value="${escapeHtml(model.name)}"${usable(model) ? "" : " disabled"}>${escapeHtml(model.name)}${model.remote ? "（云端模型，请手动配置）" : model.vision === null ? "（无法确认视觉能力）" : !model.vision ? "（非视觉模型）" : ""}</option>`).join("");
+      $("localModel").value = models.some(model => model.name === previous && usable(model)) ? previous : result.suggested_model || models.find(usable)?.name || "";
+      const count = models.filter(usable).length;
+      $("modelStatus").textContent = result.errors?.length ? result.errors.map(item => typeof item === "string" ? item : JSON.stringify(item)).join("；") : count ? `已连接 Ollama · ${count} 个本地视觉模型。新下载的模型会出现在这里，不限定品牌或版本。` : "已连接 Ollama，但未发现本地视觉模型。请按下方步骤下载支持图片输入的模型。";
+      $("ollamaHelp").open = !count;
     } catch(error) { $("localModel").innerHTML = '<option value="">无法读取模型列表</option>'; $("modelStatus").textContent = error.message; }
     finally { $("refreshModels").disabled = false; }
   }
@@ -129,6 +154,7 @@
     syncProviderFields(); $("settingsDialog").showModal(); await refreshModels();
   }
   $("settingsOpen").addEventListener("click",openSettings); $("queueSettingsOpen").addEventListener("click",openSettings);
+  $("connectOllama").addEventListener("click",() => connectOllama(false));
   $("refreshModels").addEventListener("click",refreshModels); $("providerMode").addEventListener("change",() => { if ($("providerMode").value === "compatible" && isLocal(state.config.provider_url)) $("visionEnabled").checked = false; syncProviderFields(); }); $("visionEnabled").addEventListener("change",syncProviderFields);
   $("settingsProfile").addEventListener("change",() => $("settingsProfileDescription").textContent = profiles()[$("settingsProfile").value]?.description || "");
   $("providerUrl").addEventListener("input",() => { $("keyStatus").textContent = "密钥仅用于其绑定的服务地址"; if ($("providerUrl").value.trim() !== state.config.provider_url) { $("visionEnabled").checked = false; $("keyStatus").textContent = "新地址默认关闭 AI，请核对后手动开启"; } });
@@ -165,6 +191,6 @@
   });
   window.addEventListener("framepulse-drop",event => droppedPaths(event.detail?.paths || []));
   window.framepulseDesktopDrop = droppedPaths;
-  window.framepulseQueue = {render,configChanged,openImport,showReview,showQueue};
+  window.framepulseQueue = {render,configChanged,openImport,showReview,showQueue,connectOllama};
   configChanged();
 })();

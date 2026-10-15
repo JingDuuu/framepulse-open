@@ -1,6 +1,8 @@
 # 发布与恢复
 
-当前为 **0.2.0 本地候选版本**，FMP 交换协议保持 0.1.0。仓库包含独立 Windows 桌面包的构建流程；本地构建、桌面启动、安装/卸载验证与 GitHub 公开发布是不同的验收项，完成其中一项不能替代其余项。当前按未签名本地候选交付，不宣称已通过干净机器安装验证或已在 GitHub 公开发布。GitHub 远程仓库与公开发布目标由项目所有者指定。
+当前版本 **0.2.1**，FMP 交换协议保持 0.1.0。公开项目为 [JingDuuu/framepulse-open](https://github.com/JingDuuu/framepulse-open)，本次仅发布自有源码 ZIP，不分发模型或含 FFmpeg 的桌面二进制。源码使用者运行 Setup 后可打开独立 APP。将来发布独立安装包前，完成下述对应源代码与安装验收。
+
+源码公开发布、本地构建、桌面启动和干净机器安装属于不同验收项；源码发布不表示独立安装包已公开或通过干净机器安装验证。
 
 ## 构建入口与产物
 
@@ -29,10 +31,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-desktop.ps1
 | --- | --- |
 | 冻结后台及依赖目录 | `build/backend/framepulse-backend/`，入口 `framepulse-backend.exe` |
 | 可直接启动的完整桌面目录 | `dist/win-unpacked/`，入口 `FramePulse.exe` |
-| 引导式安装包 | `dist/FramePulse-Setup-0.2.0-x64.exe` |
-| 可解压桌面 ZIP | `dist/FramePulse-0.2.0-win-x64.zip` |
+| 引导式安装包 | `dist/FramePulse-Setup-0.2.1-x64.exe` |
+| 可解压桌面 ZIP | `dist/FramePulse-0.2.1-win-x64.zip` |
 | Python wheel / sdist | `python -m build` 生成到 `dist/` |
-| allowlist 源码 ZIP | `python scripts/package-source.py` 生成 `dist/FramePulse-Open-0.2.0-source.zip` 及 `.manifest.json` |
+| allowlist 源码 ZIP | `python scripts/package-source.py` 生成 `dist/FramePulse-Open-0.2.1-source.zip` 及 `.manifest.json` |
 
 必须分发完整安装包、ZIP 或 `win-unpacked` 目录；单独复制 `FramePulse.exe` 或冻结后台 EXE 不够。NSIS 当前 `oneClick:false`、`perMachine:false`，允许选择安装目录，创建桌面/开始菜单快捷方式；`deleteAppDataOnUninstall:false` 表示配置上保留应用数据，仍需实际验证卸载行为。构建脚本关闭 `CSC_IDENTITY_AUTO_DISCOVERY`，当前候选不配置签名证书；公开发布时应单独记录签名状态及 Windows 提示。
 
@@ -44,7 +46,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-desktop.ps1
 4. 验证多文件/目录导入、暂停、取消、重试、退出和重新启动后的持久队列；凭证不得写入设置或队列文件。仅做少量队列功能测试时不得宣称通过 100 份视频或其他数量的压力基准。
 5. 实际桌面窗口验证选择/拖拽导入、播放/声音控件、跨镜跳转、证据区域定位、字段修改、确认、重开和导出。确认静态区域只对应证据帧；检查 renderer 错误及后台进程退出，不影响其他应用或 Ollama。
 6. `python -m build` 后在隔离 Python 环境安装 wheel，执行 `framepulse capabilities` 与真实图片分析。冻结后台也独立做真实媒体测量，检查 `capabilities` 中 OCR/ffprobe 是否可用，不用开发环境的能力冒充安装版能力。
-7. 使用实际构建的 `dist/win-unpacked/FramePulse.exe` 验证窗口。显式 QA 参数 `--data <绝对测试库> --smoke-output <绝对输出目录>` 会输出 `desktop-smoke.json` 和 `desktop-window.png` 并退出；它检查实际 Electron 页面、桥接、隔离设置及 renderer 错误，不等于已走完安装向导。需在独立测试目录运行，报告为打包版且后台版本为 0.2.0，并确认退出后自己创建的后台已停止。
+7. 使用实际构建的 `dist/win-unpacked/FramePulse.exe` 验证窗口。显式 QA 参数 `--data <绝对测试库> --smoke-output <绝对输出目录>` 会输出 `desktop-smoke.json` 和 `desktop-window.png` 并退出；它检查实际 Electron 页面、桥接、隔离设置及 renderer 错误，不等于已走完安装向导。需在独立测试目录运行，报告为打包版且后台版本为 0.2.1，并确认退出后自己创建的后台已停止。
 8. 分别验证 ZIP 解压启动和 NSIS 的安装、快捷方式、启动、升级/卸载、库保留。在无 Python/Node 的干净 Windows 用户环境再次验证；未执行的项目明确列为未验证。默认库、项目启动器库、自定义 `--data` 均需确认，避免误把空库当成数据丢失。
 9. 清点包内容和第三方组件声明。源码 ZIP 由 `scripts/package-source.py` allowlist 生成；排除 `runtime`、`qa-output`、`.reference`、模型、密钥、私人素材、个人路径和虚拟环境。打包桌面资源也不得携带这些数据。核对应用/包版本一致，区分 dist 中遗留的旧版本产物。
 10. 满足下述第三方分发条件后，才创建公开二进制 Release。发布后重新下载公开安装包、ZIP、源码和对应源代码包，逐个核对 SHA-256 与清单，并实际检查 Release 链接。没有公开 URL 和下载核验，不称为已上线。

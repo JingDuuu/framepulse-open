@@ -4,22 +4,31 @@
 
 FramePulse 是本地优先的 Windows 桌面 APP、分析引擎和 CLI。可以把文件或整个文件夹拖进 APP 的处理队列，也可由 FlowDesk 或其他程序调度。每份素材输出带证据的 `record.fmp.json`，原素材不会被改写。
 
-本项目参考用户提供的 FramePulse 0.7.1 核心拉片流程重新实现，产品重心从非线性剪辑台转为开放标记中间体。当前版本 `0.2.0`，协议 FMP 0.1.0 为实验草案，尚不是行业标准。
+本项目参考用户提供的 FramePulse 0.7.1 核心拉片流程重新实现，产品重心从非线性剪辑台转为开放标记中间体。当前版本 `0.2.1`，协议 FMP 0.1.0 为实验草案，尚不是行业标准。
 
-## 本地启动
+## 下载与启动（Windows APP）
 
-普通用户使用打包后的 **FramePulse.exe** 或 Windows 安装程序，无需 Python / Node.js。它打开独立窗口，内置分析后台与 FFmpeg，模型另行配置。项目内双击 **`Start-FramePulse.cmd`** 会打开桌面版并使用已有素材库；详见 [桌面使用说明](docs/DESKTOP.md)。
+当前公开发布的是**完整源码项目**，不包含模型权重、私人素材或分析库。此版本的 GitHub Release 提供源码 ZIP；独立安装包尚未公开分发。源码运行后同样是独立 Electron 桌面窗口。
 
-源码开发需要 Python 3.10+ 与 Node.js，首次双击 `Setup-FramePulse.cmd`。只使用 CLI / 本地 HTTP 服务可按以下方式安装：
+1. 在 [Releases](https://github.com/JingDuuu/framepulse-open/releases/latest) 下载源码 ZIP 并完整解压到一个普通文件夹。
+2. 安装 [Python 3.11](https://www.python.org/downloads/)（勾选 **Add Python to PATH**）和 [Node.js 22.12+](https://nodejs.org/en/download)。安装后重新打开终端或文件夹。
+3. 双击 `Setup-FramePulse.cmd`，等待依赖安装完成。首次需要联网，会下载分析依赖与 Electron，不下载大模型。
+4. 双击 `Start-FramePulse.cmd` 打开 APP，以后只需这一步。拖入素材，点击「开始队列」。
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
-.\.venv\Scripts\framepulse.exe serve --open
-```
+已在自己的机器构建独立包的用户可直接运行完整目录内的 `FramePulse.exe`；见 [桌面说明](docs/DESKTOP.md) 和 [构建说明](docs/RELEASING.md)。
 
-Linux/macOS 可使用 `.venv/bin/framepulse serve --open`；Windows 是本次验收平台。默认库在 `runtime/library`，可通过 `serve --data` 更改。
+## 连接本地 Ollama（自动优先）
+
+1. 安装并启动 [Ollama](https://ollama.com/download)。
+2. 从 [Ollama 模型库](https://ollama.com/search?c=vision) 选择支持 **Vision / 图片输入**、适合自己内存和显存的本地模型，按该模型页面的命令下载。例如先前实测过的轻量候选：`ollama pull qwen3.5:4b-q4_K_M`（这是已测示例，不代表未来最新型号）。
+3. 打开帧脉：默认自动读取本机 Ollama 已下载的视觉模型。若先打开了 APP 再启动 Ollama，首次尚未配置时每 20 秒重试。自动选中后，在「模型与分析设置」可核对名称和切换模型。
+4. 后来下载或更新了模型，点击「刷新列表」选择并保存；或点击「自动连接并保存」选取最近安装/更新的本地视觉模型。
+
+自动发现依据模型的视觉能力元数据，不限定 Qwen 名称或版本。软件不会自动下载模型，也不会把云端模型自动选作本地模型；手动保存的选择和 AI 开关会保留。各模型的结构化输出质量仍需用素材核查。
+
+无法自动连接时，可在「手动配置」填写 `http://127.0.0.1:11434/api` 和 `ollama list` 显示的完整模型名，开启 AI 后保存；本地 Ollama 通常无需密钥。完整步骤、模型升级、自定义端口和常见错误见 **[Ollama 接入指南](docs/OLLAMA.md)**。
+
+CLI / Linux / macOS 使用者安装 `pip install -e .` 后运行 `framepulse --help`；Windows 是当前桌面验收平台。
 
 ## 一次导入会完成什么
 

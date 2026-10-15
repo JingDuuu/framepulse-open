@@ -137,3 +137,15 @@ test('AI region labels preserve inference provenance on both chips and evidence 
   assert.match(h.element('regionOverlay').innerHTML,/人物 · AI 推断/);assert.match(h.element('regionChips').innerHTML,/region-source">AI 推断/);assert.doesNotMatch(h.element('regionChips').innerHTML,/已确认/);
   h.state.document.shots[0].regions[0].origin='human';h.context.renderRegionChips();assert.match(h.element('regionChips').innerHTML,/region-source">人工/);
 });
+
+test('first-run auto connect updates the selected model and does not overwrite configured users',async()=>{
+  const h=harness();h.state.config={auto_connect:true,model:'',provider_url:'http://127.0.0.1:11434/v1'};let calls=0;
+  h.stubApi(async(url,options)=>{calls++;assert.equal(url,'/api/ollama/connect');assert.equal(JSON.parse(options.body).automatic,true);return {connected:true,config:{model:'future-vision:small',vision:true,auto_connect:false}}});
+  await h.window.framepulseQueue.connectOllama(true);assert.equal(h.state.config.model,'future-vision:small');assert.match(h.element('queueModelName').textContent,/future-vision/);
+  await h.window.framepulseQueue.connectOllama(true);assert.equal(calls,1);
+});
+
+test('cloud models and unknown capabilities are not selectable in the local list',async()=>{
+  const h=harness();h.state.config={};h.stubApi(async()=>({models:[{name:'alias',vision:true,remote:true},{name:'unknown',vision:null},{name:'local-vision',vision:true,remote:false}],suggested_model:'local-vision',errors:[]}));
+  await h.element('settingsOpen').emit('click');assert.match(h.element('localModel').innerHTML,/value="alias" disabled/);assert.match(h.element('localModel').innerHTML,/无法确认视觉能力/);assert.equal(h.element('localModel').value,'local-vision');
+});

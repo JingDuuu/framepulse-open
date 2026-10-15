@@ -501,6 +501,7 @@ async function boot() {
   const url = new URL(window.location.href), assetId = url.searchParams.get("asset"), shotId = url.searchParams.get("shot");
   try { state.config = await api("/api/config"); state.token = state.config.token; window.framepulseQueue?.configChanged(); await loadAssets({autoSelect:!assetId}); if (assetId) await loadAsset(assetId,{shotId}); }
   catch(error) { $("assetList").innerHTML = '<p class="library-empty">无法读取素材库<br>请确认本地服务已启动后刷新</p>'; showToast(error.message,true); }
+  window.framepulseQueue?.connectOllama(true);
   pollJobs();
 }
 window.addEventListener("popstate",() => { const url = new URL(window.location.href), assetId = url.searchParams.get("asset"); if (assetId) loadAsset(assetId,{shotId:url.searchParams.get("shot")}); });

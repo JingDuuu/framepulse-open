@@ -65,6 +65,11 @@ class PickRequest(BaseModel):
     mode: Literal["files", "folder"] = "files"
 
 
+class OllamaConnectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    automatic: bool = False
+
+
 class ShotPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=1)
@@ -172,6 +177,10 @@ def create_app(data_dir: str | Path, *, token: str | None = None) -> FastAPI:
             return discover_models(url, settings.key_for(url))
         except ValueError as error:
             raise HTTPException(422, str(error))
+
+    @app.post("/api/ollama/connect")
+    def connect_ollama(request: OllamaConnectRequest):
+        return settings.connect_ollama(automatic=request.automatic)
 
     @app.get("/api/assets")
     def list_assets():

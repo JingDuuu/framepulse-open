@@ -1,6 +1,8 @@
 # 桌面版使用
 
-FramePulse 0.2.0 提供独立 Windows 窗口、任务栏图标、原生文件选择器与拖拽导入。打包版内置 Python 分析后台和 FFmpeg，使用者无需安装 Python、Node.js 或启动浏览器。AI 模型服务独立配置，不随安装包附带权重。
+FramePulse 0.2.1 提供独立 Windows 窗口、任务栏图标、原生文件选择器与拖拽导入。打包版内置 Python 分析后台和 FFmpeg，使用者无需安装 Python、Node.js 或启动浏览器。AI 模型服务独立配置，不随安装包附带权重。
+
+当前 GitHub Release 提供源码 ZIP；下载后按 README 安装 Python / Node 并双击 Setup、Start，即可打开本桌面 APP。下面的「打包版」描述适用于自己构建的独立包。模型接入见 [Ollama 指南](OLLAMA.md)。
 
 ## 导入与队列
 

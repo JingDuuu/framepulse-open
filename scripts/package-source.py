@@ -10,10 +10,12 @@ files = []
 for directory in ("src/framepulse", "docs", "tests", "scripts", "examples", ".github", "desktop"):
     for current, directories, names in os.walk(root / directory):
         directories[:] = [name for name in directories if name not in {"__pycache__", "node_modules", "dist", "build"}]
-        files.extend(Path(current) / name for name in names if Path(name).suffix not in (".pyc", ".pyo"))
+        files.extend(Path(current) / name for name in names if Path(name).suffix.lower() not in
+                     (".pyc", ".pyo", ".gguf", ".safetensors", ".onnx", ".pt", ".pth", ".ckpt", ".bin")
+                     and not name.endswith(".local.json") and not name.startswith(".env"))
 for name in ("pyproject.toml", "MANIFEST.in", "LICENSE", "README.md", "CONTRIBUTING.md", "CHANGELOG.md", ".gitignore", "requirements-windows-tested.txt", "Start-FramePulse.cmd", "Setup-FramePulse.cmd", "framepulse.cmd"):
     files.append(root / name)
-version = "0.2.0"
+version = "0.2.1"
 destination = root / "dist" / f"FramePulse-Open-{version}-source.zip"
 destination.parent.mkdir(exist_ok=True)
 with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
